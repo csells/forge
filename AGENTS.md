@@ -68,7 +68,7 @@ Key architectural patterns:
 - **Session state machine** — `SessionState` enum (Idle/Processing/AwaitingInput/Closed) with explicit `can_transition_to()` validation.
 - **Hierarchical errors** — Each crate defines its own `thiserror` error enums wrapping child crate errors.
 - **Serialization** — JSON for external interfaces, msgpack (`rmp-serde`) for CXDB binary protocol and internal persistence.
-- **Async runtime** — `tokio` with `current_thread` flavor everywhere (main and tests).
+- **Async runtime** — `asupersync` v0.2.6 with `current_thread` flavor everywhere (main and tests). **Zero tokio.** No polling. All real-time communication uses async WebSocket + broadcast channels. See `spec/07-asupersync-migration-spec.md`.
 - **Rust edition 2024** for all Forge crates; vendored `cxdb` uses edition 2021.
 - **Centralized status.json** — The runner writes `status.json` for ALL node types (not individual handlers). Fields: `outcome`, `preferred_next_label`, `suggested_next_ids`, `context_updates`, `notes`, `failure_reason`.
 - **Model stylesheet specificity** — Selectors: `*` (universal, 0) < shape name (1) < `.class` (2) < `#node_id` (3). Nodes without an explicit `shape` attribute default to `"box"`.
@@ -86,6 +86,7 @@ Primary specs live in `spec/` — these are the source of truth:
 - `spec/04-cxdb-integration-spec.md` — CXDB-first runtime persistence integration extension
 - `spec/05-factory-control-plane-spec.md` — factory control-plane ideation (outer-loop goals and principles)
 - `spec/06-unified-agent-provider-spec.md` — unified agent provider spec (provider-owned tool loops, CLI agent adapters)
+- `spec/07-asupersync-migration-spec.md` — asupersync runtime migration (tokio removal, WebSocket architecture, Cx propagation)
 
 When making changes, align behavior and terminology to these documents first.
 
@@ -129,7 +130,7 @@ When making changes, align behavior and terminology to these documents first.
 - Parallel-safe: tests run in parallel by default. Avoid global state and temp dirs without unique prefixes. Only serialize when necessary.
 - Property tests (optional): add a small number of targeted property tests (e.g., canonical encoding invariants). Gate heavier fuzzing behind a feature.
 - Doctests: keep crate-level examples compilable; simple examples belong in doc comments and are run with `cargo test --doc`.
-- Async tests: if needed, use `#[tokio::test(flavor = "current_thread")]` to keep scheduling deterministic.
+- Async tests: use `#[test]` + `asupersync::test_utils::run_test(|| async { ... })` for deterministic scheduling. **Do NOT use `#[tokio::test]`.**
 
 ### Testing Rules (Non-Negotiable)
 

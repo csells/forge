@@ -2,7 +2,77 @@ use crate::storage::AttractorArtifactWriter;
 use crate::{AttractorError, Graph, Node, RuntimeContext, handlers};
 use async_trait::async_trait;
 use forge_cxdb_runtime::{CxdbFsSnapshotPolicy, CxdbTurnId as TurnId};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use tokio::sync::Notify;
+
+/// Cooperative pipeline control handle.
+///
+/// Shared between the caller (web server, CLI) and the pipeline runner.
+/// The runner checks these signals at safe points between node executions.
+#[derive(Debug)]
+pub struct PipelineControl {
+    cancelled: AtomicBool,
+    paused: AtomicBool,
+    resume_notify: Notify,
+}
+
+impl PipelineControl {
+    pub fn new() -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
+            resume_notify: Notify::new(),
+        }
+    }
+
+    /// Request cancellation. The runner will exit before executing the next node.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        // Also wake any paused waiter so it can see the cancel
+        self.resume_notify.notify_one();
+    }
+
+    /// Returns true if cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Pause the pipeline. The runner will block before the next node execution.
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::Release);
+    }
+
+    /// Resume a paused pipeline.
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::Release);
+        self.resume_notify.notify_one();
+    }
+
+    /// Returns true if currently paused.
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
+    }
+
+    /// Wait until resumed or cancelled. Returns true if cancelled.
+    pub async fn wait_for_resume(&self) -> bool {
+        loop {
+            if self.is_cancelled() {
+                return true;
+            }
+            if !self.is_paused() {
+                return false;
+            }
+            self.resume_notify.notified().await;
+        }
+    }
+}
+
+impl Default for PipelineControl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum NodeStatus {
@@ -84,7 +154,6 @@ impl NodeExecutor for NoopNodeExecutor {
     }
 }
 
-#[derive(Clone)]
 pub struct RunConfig {
     pub run_id: Option<String>,
     pub base_turn_id: Option<TurnId>,
@@ -99,6 +168,7 @@ pub struct RunConfig {
     pub workspace_root: Option<PathBuf>,
     pub resume_from_checkpoint: Option<PathBuf>,
     pub max_loop_restarts: u32,
+    pub control: Option<Arc<PipelineControl>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,6 +195,7 @@ impl Default for RunConfig {
             workspace_root: None,
             resume_from_checkpoint: None,
             max_loop_restarts: 16,
+            control: None,
         }
     }
 }

@@ -1,0 +1,809 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Forge Pipeline Visualizer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x2692;</text></svg>">
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f1117; color: #e0e0e0; overflow: hidden; }
+
+/* Header */
+#header { height: 48px; background: #1a1b26; border-bottom: 1px solid #2a2b3d; display: flex; align-items: center; padding: 0 16px; gap: 12px; }
+#header .title { font-size: 14px; font-weight: 600; color: #a9b1d6; letter-spacing: 0.5px; }
+#header .pipeline-name { font-size: 14px; color: #7aa2f7; font-weight: 500; }
+#status-badge { font-size: 11px; padding: 3px 10px; border-radius: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+.badge-idle { background: #2a2b3d; color: #565f89; }
+.badge-waiting { background: #2a2530; color: #bb9af7; animation: badge-pulse 2s ease-in-out infinite; }
+.badge-running { background: #1a3a2a; color: #9ece6a; animation: badge-pulse 2s ease-in-out infinite; }
+.badge-paused { background: #2a2530; color: #e0af68; }
+.badge-success { background: #1a3a2a; color: #9ece6a; }
+.badge-stopped { background: #2a2530; color: #e0af68; }
+.badge-failed { background: #3a1a1a; color: #f7768e; }
+@keyframes badge-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+
+/* Control buttons */
+#controls { display: flex; gap: 6px; align-items: center; }
+#controls button { font-size: 11px; padding: 4px 12px; border-radius: 4px; border: 1px solid transparent; font-weight: 600; cursor: pointer; text-transform: uppercase; letter-spacing: 0.5px; transition: all 0.15s ease; }
+#controls button:hover { filter: brightness(1.2); }
+#controls button:active { transform: scale(0.97); }
+#controls button[hidden] { display: none; }
+.btn-start { background: #1a3a2a; color: #9ece6a; border-color: #2a5a3a !important; }
+.btn-pause { background: #2a2530; color: #e0af68; border-color: #3a3540 !important; }
+.btn-resume { background: #1a2a4a; color: #7aa2f7; border-color: #2a3a5a !important; }
+.btn-stop { background: #3a1a1a; color: #f7768e; border-color: #4a2a2a !important; }
+
+#loading-msg { font-size: 12px; color: #565f89; margin-left: auto; }
+
+/* Main layout */
+#main { display: flex; height: calc(100vh - 48px); }
+#graph-pane { flex: 0 0 42%; background: #13141d; overflow: hidden; position: relative; border-right: 1px solid #2a2b3d; }
+#splitter { width: 4px; background: #2a2b3d; cursor: col-resize; flex-shrink: 0; }
+#splitter:hover { background: #7aa2f7; }
+#conv-pane { flex: 1; overflow-y: auto; background: #1a1b26; padding: 16px; }
+
+/* Graph container — holds the Graphviz SVG */
+#graph-container { width: 100%; height: 100%; overflow: hidden; cursor: grab; }
+#graph-container:active { cursor: grabbing; }
+#graph-container svg { display: block; }
+
+/* Graphviz SVG dark-mode overrides */
+#graph-container .graph > polygon { fill: #13141d !important; stroke: none !important; }
+#graph-container .node text { fill: #c0caf5 !important; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important; }
+#graph-container .node polygon,
+#graph-container .node ellipse,
+#graph-container .node polyline { fill: #1e1f2e !important; stroke: #3b3d56 !important; stroke-width: 1.5px !important; }
+#graph-container .edge path { stroke: #3b3d56 !important; }
+#graph-container .edge polygon { fill: #3b3d56 !important; stroke: #3b3d56 !important; }
+#graph-container .edge text { fill: #565f89 !important; }
+
+/* Node state overrides (applied via JS to <g class="node"> elements) */
+#graph-container .node.state-active polygon,
+#graph-container .node.state-active ellipse,
+#graph-container .node.state-active polyline { fill: #1a2a4a !important; stroke: #7aa2f7 !important; stroke-width: 2px !important; }
+#graph-container .node.state-active { animation: node-glow 1.5s ease-in-out infinite; cursor: pointer; }
+
+#graph-container .node.state-completed polygon,
+#graph-container .node.state-completed ellipse,
+#graph-container .node.state-completed polyline { fill: #1a3a2a !important; stroke: #9ece6a !important; }
+#graph-container .node.state-completed { cursor: pointer; }
+
+#graph-container .node.state-failed polygon,
+#graph-container .node.state-failed ellipse,
+#graph-container .node.state-failed polyline { fill: #3a1a1a !important; stroke: #f7768e !important; }
+#graph-container .node.state-failed { cursor: pointer; }
+
+#graph-container .node.state-selected polygon,
+#graph-container .node.state-selected ellipse,
+#graph-container .node.state-selected polyline { stroke-width: 3px !important; filter: drop-shadow(0 0 6px rgba(122, 162, 247, 0.5)); }
+
+/* Edge state */
+#graph-container .edge.edge-traversed path { stroke: #7aa2f7 !important; stroke-width: 2px !important; stroke-dasharray: 8 4; animation: edge-dash 1s linear infinite; }
+#graph-container .edge.edge-traversed polygon { fill: #7aa2f7 !important; stroke: #7aa2f7 !important; }
+
+@keyframes node-glow {
+  0%, 100% { filter: drop-shadow(0 0 3px rgba(122, 162, 247, 0.3)); }
+  50% { filter: drop-shadow(0 0 10px rgba(122, 162, 247, 0.7)); }
+}
+@keyframes edge-dash { to { stroke-dashoffset: -12; } }
+
+/* Conversation pane */
+.conv-empty { color: #565f89; text-align: center; padding: 40px; font-size: 14px; }
+.conv-section { margin-bottom: 20px; border: 1px solid #2a2b3d; border-radius: 8px; overflow: hidden; }
+.conv-section.selected { border-color: #7aa2f7; }
+.conv-header { display: flex; align-items: center; gap: 8px; padding: 10px 14px; background: #1e1f2e; cursor: pointer; user-select: none; }
+.conv-header:hover { background: #24253a; }
+.conv-node-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.dot-unvisited { background: #3b3d56; }
+.dot-active { background: #7aa2f7; animation: badge-pulse 1.5s ease-in-out infinite; }
+.dot-completed { background: #9ece6a; }
+.dot-failed { background: #f7768e; }
+.conv-node-name { font-size: 13px; font-weight: 600; color: #a9b1d6; }
+.conv-node-label { font-size: 11px; color: #565f89; margin-left: auto; }
+.conv-block { padding: 12px 14px; border-top: 1px solid #2a2b3d; }
+.conv-label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px; }
+.conv-label-prompt { color: #7aa2f7; }
+.conv-label-response { color: #9ece6a; }
+.conv-label-status { color: #e0af68; }
+.conv-content { font-family: 'JetBrains Mono', 'Fira Code', monospace; font-size: 12px; line-height: 1.6; color: #c0caf5; white-space: pre-wrap; word-break: break-word; max-height: 400px; overflow-y: auto; background: #13141d; padding: 10px; border-radius: 4px; }
+.conv-content::-webkit-scrollbar { width: 6px; }
+.conv-content::-webkit-scrollbar-thumb { background: #3b3d56; border-radius: 3px; }
+.conv-loading { color: #565f89; font-style: italic; padding: 8px 14px; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<div id="header">
+  <span class="title">FORGE</span>
+  <span class="pipeline-name" id="pipeline-name">--</span>
+  <span id="status-badge" class="badge-idle">IDLE</span>
+  <div id="controls">
+    <button id="btn-start" class="btn-start" hidden>Start</button>
+    <button id="btn-pause" class="btn-pause" hidden>Pause</button>
+    <button id="btn-resume" class="btn-resume" hidden>Resume</button>
+    <button id="btn-stop" class="btn-stop" hidden>Stop</button>
+  </div>
+  <span id="loading-msg">Loading Graphviz engine...</span>
+</div>
+
+<div id="main">
+  <div id="graph-pane">
+    <div id="graph-container"></div>
+  </div>
+  <div id="splitter"></div>
+  <div id="conv-pane">
+    <div class="conv-empty" id="conv-empty">Waiting for pipeline to start...</div>
+  </div>
+</div>
+
+<script type="module">
+// === Base URL (handles reverse proxy path prefix like /forge) ===
+const BASE = (() => {
+  const path = window.location.pathname.replace(/\/+$/, '');
+  return path || '';
+})();
+
+function apiUrl(endpoint) {
+  return BASE + endpoint;
+}
+
+// === State ===
+const state = {
+  graph: null,       // parsed Graph JSON (for node metadata)
+  nodeStates: {},    // node_id -> 'unvisited' | 'active' | 'completed' | 'failed'
+  selectedNodeId: null,
+  svgContainer: null,
+  nodeElements: {},  // node_id -> SVG <g> element
+  edgeElements: {},  // "from->to" -> SVG <g> element
+};
+
+// === Control Buttons ===
+function initControls() {
+  document.getElementById('btn-start').addEventListener('click', () => controlAction('start'));
+  document.getElementById('btn-pause').addEventListener('click', () => controlAction('pause'));
+  document.getElementById('btn-resume').addEventListener('click', () => controlAction('resume'));
+  document.getElementById('btn-stop').addEventListener('click', () => controlAction('stop'));
+}
+
+async function controlAction(action) {
+  try {
+    const resp = await fetch(apiUrl(`/api/control/${action}`), { method: 'POST' });
+    if (!resp.ok) console.warn(`Control ${action} returned ${resp.status}`);
+    // Re-fetch status to update UI immediately
+    const statusResp = await fetch(apiUrl('/api/status'));
+    if (statusResp.ok) applyStatus(await statusResp.json());
+  } catch (e) {
+    console.error(`Control ${action} failed:`, e);
+  }
+}
+
+function showControls(which) {
+  for (const id of ['btn-start', 'btn-pause', 'btn-resume', 'btn-stop']) {
+    document.getElementById(id).hidden = !which.includes(id.replace('btn-', ''));
+  }
+}
+
+// === Init ===
+async function init() {
+  const loadingMsg = document.getElementById('loading-msg');
+  initControls();
+
+  try {
+    // Fetch graph JSON + DOT source in parallel, plus load viz.js
+    const [graphResp, dotResp, vizModule] = await Promise.all([
+      fetch(apiUrl('/api/graph')),
+      fetch(apiUrl('/api/dot')),
+      import('https://cdn.jsdelivr.net/npm/@viz-js/viz@3/+esm'),
+    ]);
+
+    if (!graphResp.ok) throw new Error('Failed to fetch graph: ' + graphResp.status);
+    if (!dotResp.ok) throw new Error('Failed to fetch DOT: ' + dotResp.status);
+
+    state.graph = await graphResp.json();
+    const dotSource = await dotResp.text();
+
+    loadingMsg.textContent = 'Rendering graph...';
+
+    // Set pipeline name
+    document.getElementById('pipeline-name').textContent =
+      getAttr(state.graph.attrs, 'label') || state.graph.id || 'Pipeline';
+
+    // Initialize all nodes as unvisited
+    for (const id of Object.keys(state.graph.nodes)) {
+      state.nodeStates[id] = 'unvisited';
+    }
+
+    // Render DOT → SVG using Graphviz WASM
+    const viz = await vizModule.instance();
+    const svgString = viz.renderString(dotSource, { format: 'svg', engine: 'dot' });
+
+    // Insert SVG into page
+    const container = document.getElementById('graph-container');
+    container.innerHTML = svgString;
+    state.svgContainer = container;
+
+    const svgEl = container.querySelector('svg');
+    if (svgEl) {
+      svgEl.setAttribute('width', '100%');
+      svgEl.setAttribute('height', '100%');
+      svgEl.style.background = 'transparent';
+    }
+
+    // Build lookup maps for node/edge SVG elements
+    buildSvgMaps();
+
+    // Make nodes clickable
+    for (const [nodeId, el] of Object.entries(state.nodeElements)) {
+      el.style.cursor = 'pointer';
+      el.addEventListener('click', () => selectNode(nodeId));
+    }
+
+    // Pan/zoom
+    initPanZoom(container, svgEl);
+
+    loadingMsg.textContent = '';
+
+    // Fetch initial status
+    const statusResp = await fetch(apiUrl('/api/status'));
+    if (statusResp.ok) {
+      const status = await statusResp.json();
+      applyStatus(status);
+    }
+
+    // Connect to SSE
+    connectSSE();
+
+  } catch (e) {
+    console.error('Init failed:', e);
+    loadingMsg.textContent = 'Error: ' + e.message;
+  }
+}
+
+// === Build SVG element lookup maps ===
+function buildSvgMaps() {
+  const container = state.svgContainer;
+  if (!container) return;
+
+  // Graphviz SVG: each node is <g class="node"><title>node_id</title>...</g>
+  container.querySelectorAll('g.node').forEach(g => {
+    const titleEl = g.querySelector('title');
+    if (titleEl) {
+      const nodeId = titleEl.textContent.trim();
+      state.nodeElements[nodeId] = g;
+    }
+  });
+
+  // Edges: <g class="edge"><title>from&#45;&gt;to</title>...</g>
+  container.querySelectorAll('g.edge').forEach(g => {
+    const titleEl = g.querySelector('title');
+    if (titleEl) {
+      // Graphviz encodes -> as &#45;&gt; in title text, but textContent decodes it
+      const titleText = titleEl.textContent.trim();
+      // Format is "from->to"
+      const match = titleText.match(/^(.+)->(.+)$/);
+      if (match) {
+        const key = match[1].trim() + '->' + match[2].trim();
+        state.edgeElements[key] = g;
+      }
+    }
+  });
+
+  // Debug logging (remove in production)
+  // console.log('Node elements:', Object.keys(state.nodeElements));
+  // console.log('Edge elements:', Object.keys(state.edgeElements));
+}
+
+// === Pan/Zoom ===
+function initPanZoom(container, svgEl) {
+  if (!svgEl) return;
+
+  let scale = 1;
+  let panX = 0;
+  let panY = 0;
+  let dragging = false;
+  let startX = 0;
+  let startY = 0;
+
+  const graphGroup = svgEl.querySelector('g.graph');
+  if (!graphGroup) return;
+
+  function applyTransform() {
+    // We transform the top-level <g> inside the SVG
+    graphGroup.setAttribute('transform', `translate(${panX},${panY}) scale(${scale})`);
+  }
+
+  container.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const factor = e.deltaY < 0 ? 1.1 : 0.9;
+    const newScale = Math.max(0.2, Math.min(5, scale * factor));
+
+    // Zoom toward mouse position
+    const rect = container.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    panX = mx - (mx - panX) * (newScale / scale);
+    panY = my - (my - panY) * (newScale / scale);
+    scale = newScale;
+    applyTransform();
+  }, { passive: false });
+
+  container.addEventListener('mousedown', (e) => {
+    if (e.target.closest('.node')) return; // don't drag when clicking a node
+    dragging = true;
+    startX = e.clientX - panX;
+    startY = e.clientY - panY;
+    e.preventDefault();
+  });
+
+  window.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    panX = e.clientX - startX;
+    panY = e.clientY - startY;
+    applyTransform();
+  });
+
+  window.addEventListener('mouseup', () => { dragging = false; });
+
+  // Touch support for mobile
+  let lastTouchDist = 0;
+  let lastTouchX = 0;
+  let lastTouchY = 0;
+
+  container.addEventListener('touchstart', (e) => {
+    if (e.touches.length === 1) {
+      dragging = true;
+      startX = e.touches[0].clientX - panX;
+      startY = e.touches[0].clientY - panY;
+    } else if (e.touches.length === 2) {
+      dragging = false;
+      lastTouchDist = Math.hypot(
+        e.touches[0].clientX - e.touches[1].clientX,
+        e.touches[0].clientY - e.touches[1].clientY
+      );
+      lastTouchX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+      lastTouchY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+    }
+  }, { passive: true });
+
+  container.addEventListener('touchmove', (e) => {
+    if (e.touches.length === 1 && dragging) {
+      panX = e.touches[0].clientX - startX;
+      panY = e.touches[0].clientY - startY;
+      applyTransform();
+    } else if (e.touches.length === 2) {
+      e.preventDefault();
+      const dist = Math.hypot(
+        e.touches[0].clientX - e.touches[1].clientX,
+        e.touches[0].clientY - e.touches[1].clientY
+      );
+      const factor = dist / lastTouchDist;
+      const newScale = Math.max(0.2, Math.min(5, scale * factor));
+      const cx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+      const cy = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+      const rect = container.getBoundingClientRect();
+      const mx = cx - rect.left;
+      const my = cy - rect.top;
+      panX = mx - (mx - panX) * (newScale / scale);
+      panY = my - (my - panY) * (newScale / scale);
+      scale = newScale;
+      lastTouchDist = dist;
+      applyTransform();
+    }
+  }, { passive: false });
+
+  container.addEventListener('touchend', () => { dragging = false; });
+}
+
+// === Attribute helpers ===
+function getAttr(attrs, key) {
+  if (!attrs || !attrs.values) return null;
+  const v = attrs.values[key];
+  if (!v) return null;
+  if (typeof v === 'object') {
+    if ('String' in v) return v.String;
+    if ('Integer' in v) return v.Integer;
+    if ('Boolean' in v) return v.Boolean;
+    if ('Float' in v) return v.Float;
+  }
+  return v;
+}
+
+function getShape(node) {
+  return getAttr(node.attrs, 'shape') || 'box';
+}
+
+function getLabel(nodeId, node) {
+  return getAttr(node.attrs, 'label') || nodeId;
+}
+
+// Structural nodes (start/exit) have no prompt/response artifacts
+function isStructuralNode(nodeId) {
+  const node = state.graph && state.graph.nodes[nodeId];
+  if (!node) return false;
+  const shape = getShape(node);
+  return shape === 'Mdiamond' || shape === 'Msquare';
+}
+
+// === Event Polling (long-poll via /api/events?after=<seq>) ===
+function connectSSE() {
+  let lastSeq = 0;
+  async function poll() {
+    while (true) {
+      try {
+        const resp = await fetch(apiUrl(`/api/events?after=${lastSeq}`));
+        if (!resp.ok) { await sleep(2000); continue; }
+        const seqHeader = resp.headers.get('X-Last-Seq');
+        if (seqHeader) lastSeq = parseInt(seqHeader, 10) || lastSeq;
+        const text = await resp.text();
+        // Parse SSE-formatted text: each event is "data: <json>\n\n"
+        for (const line of text.split('\n')) {
+          if (line.startsWith('data: ')) {
+            try {
+              const event = JSON.parse(line.slice(6));
+              handleEvent(event);
+            } catch (e) { /* skip unparseable lines */ }
+          }
+        }
+      } catch (e) {
+        // Network error — retry after delay
+        await sleep(2000);
+      }
+    }
+  }
+  poll();
+}
+
+// === Apply initial status (catch-up for late joiners) ===
+function applyStatus(status) {
+  switch (status.state) {
+    case 'waiting_for_start':
+      setBadge('waiting');
+      showControls(['start']);
+      break;
+    case 'not_started':
+      setBadge('idle');
+      showControls([]);
+      break;
+    case 'running':
+      setBadge('running');
+      showControls(['pause', 'stop']);
+      for (const nid of (status.active_nodes || [])) setNodeState(nid, 'active');
+      for (const nid of (status.completed_nodes || [])) setNodeState(nid, 'completed');
+      for (const nid of (status.failed_nodes || [])) setNodeState(nid, 'failed');
+      break;
+    case 'paused':
+      setBadge('paused');
+      showControls(['resume', 'stop']);
+      for (const nid of (status.active_nodes || [])) setNodeState(nid, 'active');
+      for (const nid of (status.completed_nodes || [])) setNodeState(nid, 'completed');
+      for (const nid of (status.failed_nodes || [])) setNodeState(nid, 'failed');
+      break;
+    case 'completed':
+      setBadge('success');
+      showControls([]);
+      for (const nid of (status.completed_nodes || [])) setNodeState(nid, 'completed');
+      for (const nid of (status.completed_nodes || [])) {
+        if (!isStructuralNode(nid)) {
+          fetchArtifact(nid, 'prompt.md');
+          fetchArtifact(nid, 'response.md');
+          fetchArtifact(nid, 'status.json');
+        }
+      }
+      break;
+    case 'stopped':
+      setBadge('stopped');
+      showControls([]);
+      for (const nid of (status.completed_nodes || [])) setNodeState(nid, 'completed');
+      break;
+    case 'failed':
+      setBadge('failed');
+      showControls([]);
+      break;
+    default:
+      setBadge('idle');
+      showControls([]);
+  }
+}
+
+// === Event Handling ===
+function handleEvent(event) {
+  const kind = event.kind;
+  if (!kind) return;
+
+  switch (kind.category) {
+    case 'pipeline': handlePipelineEvent(kind); break;
+    case 'stage': handleStageEvent(kind); break;
+    case 'parallel': handleParallelEvent(kind); break;
+    case 'interview': handleInterviewEvent(kind); break;
+  }
+}
+
+function handlePipelineEvent(kind) {
+  switch (kind.kind) {
+    case 'started':
+    case 'resumed':
+      setBadge('running');
+      showControls(['pause', 'stop']);
+      break;
+    case 'paused':
+      setBadge('paused');
+      showControls(['resume', 'stop']);
+      break;
+    case 'stopped':
+      setBadge('stopped');
+      showControls([]);
+      break;
+    case 'completed':
+      setBadge('success');
+      showControls([]);
+      break;
+    case 'failed':
+      setBadge('failed');
+      showControls([]);
+      break;
+  }
+}
+
+function handleStageEvent(kind) {
+  const nodeId = kind.node_id;
+  if (!nodeId) return;
+
+  switch (kind.kind) {
+    case 'started':
+      setNodeState(nodeId, 'active');
+      markIncomingEdge(nodeId);
+      setTimeout(() => fetchArtifact(nodeId, 'prompt.md'), 800);
+      break;
+    case 'completed':
+      setNodeState(nodeId, 'completed');
+      fetchArtifact(nodeId, 'response.md');
+      fetchArtifact(nodeId, 'status.json');
+      break;
+    case 'failed':
+      if (!kind.will_retry) setNodeState(nodeId, 'failed');
+      fetchArtifact(nodeId, 'status.json');
+      break;
+  }
+}
+
+function handleParallelEvent(kind) {
+  switch (kind.kind) {
+    case 'started':
+      setNodeState(kind.node_id, 'active');
+      break;
+    case 'branch_started':
+      if (kind.target_node) {
+        setNodeState(kind.target_node, 'active');
+        markEdge(kind.node_id, kind.target_node);
+      }
+      break;
+    case 'branch_completed':
+      if (kind.target_node) setNodeState(kind.target_node, 'completed');
+      break;
+    case 'completed':
+      setNodeState(kind.node_id, 'completed');
+      break;
+  }
+}
+
+function handleInterviewEvent(kind) {
+  switch (kind.kind) {
+    case 'started':
+      setNodeState(kind.node_id, 'active');
+      ensureConvSection(kind.node_id);
+      appendConvBlock(kind.node_id, 'prompt', 'Waiting for human input...');
+      break;
+    case 'completed':
+      setNodeState(kind.node_id, 'completed');
+      if (kind.selected) appendConvBlock(kind.node_id, 'response', 'Selected: ' + kind.selected);
+      break;
+    case 'timeout':
+      setNodeState(kind.node_id, 'completed');
+      appendConvBlock(kind.node_id, 'response', 'Timeout -- default: ' + (kind.default_selected || 'none'));
+      break;
+  }
+}
+
+// === Node State Management ===
+function setNodeState(nodeId, newState) {
+  state.nodeStates[nodeId] = newState;
+
+  // Update SVG node element
+  const el = state.nodeElements[nodeId];
+  if (el) {
+    el.classList.remove('state-active', 'state-completed', 'state-failed');
+    if (newState !== 'unvisited') {
+      el.classList.add('state-' + newState);
+    }
+  }
+
+  // Update conversation dot
+  const dot = document.querySelector(`[data-conv-node="${nodeId}"] .conv-node-dot`);
+  if (dot) {
+    dot.className = 'conv-node-dot dot-' + newState;
+  }
+
+  // Ensure conversation section exists for non-structural nodes
+  const node = state.graph.nodes[nodeId];
+  if (node) {
+    const shape = getShape(node);
+    if (shape !== 'Mdiamond' && shape !== 'Msquare') {
+      ensureConvSection(nodeId);
+    }
+  }
+}
+
+// === Edge Traversal ===
+function markIncomingEdge(toNodeId) {
+  if (!state.graph) return;
+  for (const edge of state.graph.edges) {
+    if (edge.to === toNodeId && state.nodeStates[edge.from] === 'completed') {
+      markEdge(edge.from, toNodeId);
+      return;
+    }
+  }
+}
+
+function markEdge(fromId, toId) {
+  const key = fromId + '->' + toId;
+  const el = state.edgeElements[key];
+  if (el) {
+    el.classList.add('edge-traversed');
+  }
+}
+
+// === Bidirectional Selection ===
+function selectNode(nodeId) {
+  // Deselect previous
+  if (state.selectedNodeId && state.nodeElements[state.selectedNodeId]) {
+    state.nodeElements[state.selectedNodeId].classList.remove('state-selected');
+  }
+
+  state.selectedNodeId = nodeId;
+
+  // Highlight in graph
+  const el = state.nodeElements[nodeId];
+  if (el) el.classList.add('state-selected');
+
+  // Highlight in conversation
+  document.querySelectorAll('.conv-section').forEach(s => s.classList.remove('selected'));
+  const section = document.querySelector(`[data-conv-node="${nodeId}"]`);
+  if (section) {
+    section.classList.add('selected');
+    section.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+}
+// Expose to onclick handlers in HTML
+window.selectNode = selectNode;
+
+// === Conversation Pane ===
+function ensureConvSection(nodeId) {
+  if (document.querySelector(`[data-conv-node="${nodeId}"]`)) return;
+
+  const empty = document.getElementById('conv-empty');
+  if (empty) empty.remove();
+
+  const node = state.graph.nodes[nodeId];
+  const label = node ? getLabel(nodeId, node) : nodeId;
+  const nodeState = state.nodeStates[nodeId] || 'unvisited';
+
+  const section = document.createElement('div');
+  section.className = 'conv-section';
+  section.setAttribute('data-conv-node', nodeId);
+  section.innerHTML = `
+    <div class="conv-header" onclick="selectNode('${escapeAttr(nodeId)}')">
+      <span class="conv-node-dot dot-${nodeState}"></span>
+      <span class="conv-node-name">${escapeHtml(nodeId)}</span>
+      <span class="conv-node-label">${escapeHtml(label)}</span>
+    </div>
+  `;
+  document.getElementById('conv-pane').appendChild(section);
+}
+
+function appendConvBlock(nodeId, type, content) {
+  ensureConvSection(nodeId);
+  const section = document.querySelector(`[data-conv-node="${nodeId}"]`);
+  if (!section) return;
+
+  const loading = section.querySelector('.conv-loading');
+  if (loading) loading.remove();
+
+  let block = section.querySelector(`.conv-block-${type}`);
+  if (block) {
+    block.querySelector('.conv-content').textContent = content;
+    return;
+  }
+
+  block = document.createElement('div');
+  block.className = `conv-block conv-block-${type}`;
+
+  const labelClass = type === 'prompt' ? 'conv-label-prompt'
+    : type === 'response' ? 'conv-label-response'
+    : 'conv-label-status';
+
+  const labelText = type === 'status' ? 'Status' : type.charAt(0).toUpperCase() + type.slice(1);
+
+  block.innerHTML = `
+    <div class="conv-label ${labelClass}">${labelText}</div>
+    <pre class="conv-content">${escapeHtml(content)}</pre>
+  `;
+  section.appendChild(block);
+  block.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+// === Artifact Fetching ===
+async function fetchArtifact(nodeId, filename, retries = 3, delay = 600) {
+  const type = filename === 'prompt.md' ? 'prompt'
+    : filename === 'response.md' ? 'response'
+    : 'status';
+
+  for (let i = 0; i < retries; i++) {
+    try {
+      const resp = await fetch(apiUrl(`/api/artifacts/${encodeURIComponent(nodeId)}/${filename}`));
+      if (resp.ok) {
+        const content = await resp.text();
+        if (content.trim()) {
+          appendConvBlock(nodeId, type, content.trim());
+          return;
+        }
+      }
+    } catch (e) { /* retry */ }
+    if (i < retries - 1) await sleep(delay);
+  }
+}
+
+// === Status Badge ===
+function setBadge(status) {
+  const badge = document.getElementById('status-badge');
+  badge.className = 'badge-' + status;
+  const labels = {
+    idle: 'IDLE', waiting: 'WAITING', running: 'RUNNING',
+    paused: 'PAUSED', stopped: 'STOPPED', success: 'COMPLETED', failed: 'FAILED',
+  };
+  badge.textContent = labels[status] || status.toUpperCase();
+}
+
+// === Splitter Drag ===
+(function initSplitter() {
+  const splitter = document.getElementById('splitter');
+  const graphPane = document.getElementById('graph-pane');
+  let dragging = false;
+
+  splitter.addEventListener('mousedown', (e) => {
+    dragging = true;
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    const mainRect = document.getElementById('main').getBoundingClientRect();
+    const pct = ((e.clientX - mainRect.left) / mainRect.width) * 100;
+    graphPane.style.flex = `0 0 ${Math.max(20, Math.min(70, pct))}%`;
+  });
+  document.addEventListener('mouseup', () => {
+    if (dragging) { dragging = false; document.body.style.cursor = ''; document.body.style.userSelect = ''; }
+  });
+})();
+
+// === Utilities ===
+function escapeHtml(text) {
+  const d = document.createElement('div');
+  d.textContent = text;
+  return d.innerHTML;
+}
+
+function escapeAttr(text) {
+  return text.replace(/'/g, "\\'").replace(/"/g, '&quot;');
+}
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+// === Boot ===
+init();
+</script>
+</body>
+</html>

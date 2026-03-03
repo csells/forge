@@ -22,7 +22,6 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::sleep;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex as AsyncMutex;
@@ -583,6 +582,49 @@ impl PipelineRunner {
             }
 
             while forced_terminal_status.is_none() {
+                // --- Pipeline control: check for cancel/pause signals ---
+                if let Some(ref ctrl) = config.control {
+                    if ctrl.is_cancelled() {
+                        terminal_failure =
+                            Some("pipeline stopped by user".to_string());
+                        forced_terminal_status = Some(PipelineStatus::Fail);
+                        emit_runtime_event(
+                            &event_sink,
+                            &mut event_sequence_no,
+                            RuntimeEventKind::Pipeline(PipelineEvent::Stopped {
+                                run_id: active_run_id.clone(),
+                                reason: "stopped by user".to_string(),
+                            }),
+                        );
+                        break;
+                    }
+                    if ctrl.is_paused() {
+                        emit_runtime_event(
+                            &event_sink,
+                            &mut event_sequence_no,
+                            RuntimeEventKind::Pipeline(PipelineEvent::Paused {
+                                run_id: active_run_id.clone(),
+                                node_id: current_node_id.clone(),
+                            }),
+                        );
+                        let was_cancelled = ctrl.wait_for_resume().await;
+                        if was_cancelled {
+                            terminal_failure =
+                                Some("pipeline stopped by user".to_string());
+                            forced_terminal_status = Some(PipelineStatus::Fail);
+                            emit_runtime_event(
+                                &event_sink,
+                                &mut event_sequence_no,
+                                RuntimeEventKind::Pipeline(PipelineEvent::Stopped {
+                                    run_id: active_run_id.clone(),
+                                    reason: "stopped by user".to_string(),
+                                }),
+                            );
+                            break;
+                        }
+                    }
+                }
+
                 let node = graph.nodes.get(&current_node_id).ok_or_else(|| {
                     AttractorError::InvalidGraph(format!(
                         "runtime traversal reached unknown node '{}'",
@@ -1328,7 +1370,7 @@ async fn execute_with_retry(
                 )
                 .await?;
             if delay_ms > 0 {
-                sleep(Duration::from_millis(delay_ms));
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             }
             continue;
         }

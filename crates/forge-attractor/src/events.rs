@@ -44,6 +44,14 @@ pub enum PipelineEvent {
         lineage_attempt: u32,
         reason: String,
     },
+    Paused {
+        run_id: String,
+        node_id: String,
+    },
+    Stopped {
+        run_id: String,
+        reason: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

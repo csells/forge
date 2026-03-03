@@ -1,3 +1,5 @@
+mod watch;
+
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use forge_agent::{
     AnthropicProviderProfile, CxdbPersistenceMode as AgentCxdbPersistenceMode,
@@ -41,6 +43,7 @@ enum Commands {
     Run(RunArgs),
     Resume(ResumeArgs),
     InspectCheckpoint(InspectCheckpointArgs),
+    Watch(WatchArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -97,15 +100,45 @@ struct InspectCheckpointArgs {
     json: bool,
 }
 
+#[derive(clap::Args, Debug)]
+pub(crate) struct WatchArgs {
+    #[arg(long)]
+    pub dot_file: Option<PathBuf>,
+    #[arg(long)]
+    pub dot_source: Option<String>,
+    #[arg(long)]
+    pub run_id: Option<String>,
+    #[arg(long)]
+    pub logs_root: Option<PathBuf>,
+    #[arg(long, value_enum, default_value_t = InterviewerMode::Auto)]
+    pub interviewer: InterviewerMode,
+    #[arg(long, value_enum, default_value_t = BackendMode::Agent)]
+    pub backend: BackendMode,
+    #[arg(long = "human-answer")]
+    pub human_answers: Vec<String>,
+    /// Port to serve the web UI on
+    #[arg(long, default_value_t = 8384)]
+    pub port: u16,
+    /// Bind address
+    #[arg(long, default_value = "127.0.0.1")]
+    pub bind: String,
+    /// Open browser automatically
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub open: bool,
+    /// Don't start pipeline immediately; show Start button in UI
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub wait_for_start: bool,
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
-enum InterviewerMode {
+pub(crate) enum InterviewerMode {
     Auto,
     Console,
     Queue,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
-enum BackendMode {
+pub(crate) enum BackendMode {
     Agent,
     Mock,
     ClaudeCode,
@@ -114,21 +147,41 @@ enum BackendMode {
 }
 
 #[derive(Clone, Debug)]
-struct CxdbHostConfig {
-    persistence: AttractorCxdbPersistenceMode,
-    binary_addr: String,
-    http_base_url: String,
+pub(crate) struct CxdbHostConfig {
+    pub persistence: AttractorCxdbPersistenceMode,
+    pub binary_addr: String,
+    pub http_base_url: String,
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     load_env_files();
     let cli = Cli::parse();
-    let result = match cli.command {
-        Commands::Run(args) => run_command(args).await,
-        Commands::Resume(args) => resume_command(args).await,
-        Commands::InspectCheckpoint(args) => inspect_checkpoint_command(args),
-    };
+
+    // Watch subcommand runs on asupersync runtime — handle before entering tokio
+    if let Commands::Watch(args) = cli.command {
+        return match watch::run_sync(args) {
+            Ok(code) => code,
+            Err(error) => {
+                eprintln!("error: {error}");
+                ExitCode::from(1)
+            }
+        };
+    }
+
+    // All other commands run on tokio
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+
+    let result = rt.block_on(async {
+        match cli.command {
+            Commands::Run(args) => run_command(args).await,
+            Commands::Resume(args) => resume_command(args).await,
+            Commands::InspectCheckpoint(args) => inspect_checkpoint_command(args),
+            Commands::Watch(_) => unreachable!("handled above"),
+        }
+    });
 
     match result {
         Ok(code) => code,
@@ -153,7 +206,7 @@ fn first_non_empty_env(keys: &[&str]) -> Option<String> {
     })
 }
 
-fn cxdb_host_config_from_env() -> Result<CxdbHostConfig, String> {
+pub(crate) fn cxdb_host_config_from_env() -> Result<CxdbHostConfig, String> {
     let persistence_raw = first_non_empty_env(&["FORGE_CXDB_PERSISTENCE", "CXDB_PERSISTENCE_MODE"])
         .unwrap_or_else(|| "required".to_string())
         .to_ascii_lowercase();
@@ -206,7 +259,7 @@ fn build_cxdb_clients(
     Ok((binary, http))
 }
 
-fn build_runtime_persistence(
+pub(crate) fn build_runtime_persistence(
     cxdb: &CxdbHostConfig,
 ) -> Result<
     (
@@ -346,7 +399,7 @@ fn inspect_checkpoint_command(args: InspectCheckpointArgs) -> Result<ExitCode, S
     Ok(ExitCode::SUCCESS)
 }
 
-fn load_dot_source(dot_file: Option<&Path>, dot_source: Option<&str>) -> Result<String, String> {
+pub(crate) fn load_dot_source(dot_file: Option<&Path>, dot_source: Option<&str>) -> Result<String, String> {
     match (dot_file, dot_source) {
         (Some(_), Some(_)) => Err("provide only one of --dot-file or --dot-source".to_string()),
         (None, None) => Err("one of --dot-file or --dot-source is required".to_string()),
@@ -380,7 +433,7 @@ fn event_stream(
     (RuntimeEventSink::with_sender(tx), Some(task))
 }
 
-fn build_executor(
+pub(crate) fn build_executor(
     mode: InterviewerMode,
     backend_mode: BackendMode,
     human_answers: Vec<String>,
