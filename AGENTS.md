@@ -97,7 +97,7 @@ When making changes, align behavior and terminology to these documents first.
   - `crates/forge-llm/` — unified LLM client library (primary target for spec/01)
   - `crates/forge-agent/` — coding agent loop library (primary target for spec/02)
   - `crates/forge-attractor/` — Attractor DOT front-end and runtime (primary target for spec/03)
-  - `crates/forge-cli/` — in-process CLI host for Attractor runtime surfaces
+  - `crates/forge-cli/` — in-process CLI host for Attractor runtime surfaces; watch visualizer uses raw `TcpListener` + `httparse` + `asupersync` `WebSocketAcceptor` (Cytoscape.js + cytoscape-dagre + Split.js frontend, native WebSocket, broadcast channel for event fan-out)
   - `crates/forge-cxdb/` — vendored CXDB Rust client (package name: `cxdb`, not `forge-cxdb`)
   - `crates/forge-cxdb-runtime/` — CXDB runtime integration (binary/HTTP client traits, runtime store, deterministic fake)
 - Persistence layering (see spec/04):

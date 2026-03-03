@@ -544,6 +544,7 @@ dependencies = [
  "forge-attractor",
  "forge-cxdb-runtime",
  "forge-llm",
+ "httparse",
  "libc",
  "serde",
  "serde_json",

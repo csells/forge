@@ -1,6 +1,6 @@
 # Spec 07 — Asupersync Runtime Migration
 
-**Status:** Proposed
+**Status:** In Progress — Phase 5b (watch server WebSocket) complete; Phases 1–4 pending
 **Scope:** Full workspace — forge-cli, forge-attractor, forge-agent, forge-llm, forge-cxdb-runtime
 **Goal:** Replace tokio with asupersync as the sole async runtime across the entire Forge stack.
 
@@ -16,9 +16,9 @@ Forge currently uses tokio as its async runtime across all crates. This creates 
 
 4. **No structured concurrency.** Tokio's task model is flat — there's no parent-child relationship between tasks. asupersync enforces hierarchical region ownership where parent close cascades to children.
 
-5. **Mixed runtime complexity.** The current `forge-cli watch` command already runs asupersync for HTTP serving alongside tokio for the pipeline — requiring separate threads, separate runtimes, and `std::sync` bridges. A single runtime eliminates this architectural complexity.
+5. **Mixed runtime complexity.** The `forge-cli watch` command currently runs asupersync for TCP/WebSocket serving alongside two separate tokio threads (pipeline runner and event bridge) — requiring `std::sync` primitives and thread-boundary coordination. A single runtime eliminates this architectural complexity. **Note:** The watch server was already migrated to use asupersync for TCP/WS (Phase 5b complete), but the pipeline and bridge threads still use tokio internally pending Phases 1–4.
 
-6. **WebSocket-native event streaming.** The current long-poll SSE implementation is a hack forced by the inability to upgrade HTTP connections within `Http1Listener`. With a unified asupersync runtime, we can use native WebSocket connections for all real-time communication — lower latency, lower overhead, bidirectional.
+6. **WebSocket-native event streaming.** The previous long-poll SSE implementation was a hack forced by the inability to upgrade HTTP connections within `Http1Listener`. This has been replaced with native WebSocket (Phase 5b complete). The remaining goal is to use WebSocket for all real-time communication — including control commands and artifact requests — once the full single-runtime unification is complete.
 
 **Note on event delivery semantics:** The cancellation data-loss protection in point 1 refers specifically to asupersync's two-phase reserve/commit pattern for channel operations — a reserved send cannot be lost on cancellation. This is distinct from the backpressure-induced `try_send` event drops in §3.8, which are a deliberate best-effort design choice for the event observation path. Pipeline data integrity uses the cancel-safe patterns; event observation uses lossy best-effort delivery. These are different categories.
 
@@ -823,19 +823,50 @@ asupersync introduces new error types that must integrate with Forge's `thiserro
 
 ## 5. WebSocket Architecture (forge-cli watch)
 
-The current watch implementation uses long-poll SSE over HTTP. The new architecture uses WebSocket for all communication after the initial HTML page load.
+**Implementation status:** Phase 5b is complete. The watch server now uses asupersync's `TcpListener` + `httparse` + `WebSocketAcceptor` for real-time event delivery. The pipeline and event bridge still run on separate tokio threads (pending Phases 1–4). See §5.1 for the as-built architecture and §5.6 for the target single-runtime architecture (post-Phases 1–4).
 
-**Breaking change:** The existing REST API endpoints are removed. This is acceptable because the watch command is an internal development tool.
+**Migration from SSE:** The previous watch implementation used long-poll SSE (`EventSource` in the browser, tokio `Http1Listener` + SSE sink on the server). This has been replaced with native WebSocket.
 
-### 5.1 Server Architecture
+### 5.1 Server Architecture (As-Built)
+
+The current implementation uses a hybrid architecture: asupersync handles TCP/WebSocket, while the pipeline engine and event bridge still run on separate tokio threads. This is acceptable as a transitional state — the threads communicate via `std::sync` primitives and `Notify`.
 
 ```
-TcpListener (single port)
-    │
-    ├── GET /        →  Serve HTML (raw HTTP response, ~10 lines)
-    │
-    └── GET /ws      →  WebSocket upgrade via WebSocketAcceptor
+                    ┌─────────────────────────────────────────────┐
+                    │  std::thread: "forge-watch-bridge"           │
+                    │  (tokio current_thread runtime)              │
+                    │  tokio mpsc rx → EventLog + Notify.notify() │
+                    └────────────────────┬────────────────────────┘
+                                         │ std::sync
+                    ┌────────────────────▼────────────────────────┐
+                    │  std::thread: "forge-watch-pipeline"         │
+                    │  (tokio current_thread runtime)              │
+                    │  PipelineRunner.run() → RuntimeEventSink     │
+                    │  tokio mpsc tx → bridge thread               │
+                    └─────────────────────────────────────────────┘
+
+                    ┌─────────────────────────────────────────────┐
+                    │  asupersync runtime (main thread)            │
+                    │  RuntimeBuilder::current_thread()            │
+                    │                                              │
+                    │  TcpListener (single port)                   │
+                    │      │                                       │
+                    │      ├── GET /         → Serve HTML          │
+                    │      ├── GET /api/*    → REST endpoints       │
+                    │      ├── POST /api/*   → Control endpoints    │
+                    │      └── GET /ws       → WebSocket upgrade    │
+                    │                │                             │
+                    │  handle.try_spawn(per-client WS task)        │
+                    │      │                                       │
+                    │      └── ws_client_loop:                     │
+                    │           Notify.notified() OR               │
+                    │           timeout(15s) + ping keepalive       │
+                    └─────────────────────────────────────────────┘
 ```
+
+**Shared state (AppState):** All three threads/runtimes share a single `Arc<AppState>` using `std::sync` primitives (`RwLock`, `Mutex`, `AtomicBool`). The asupersync `Notify` is used for WS client wakeup — it works correctly across runtimes because `Notify::notify_waiters()` does not require `&Cx`.
+
+**HTTP request parsing (use `httparse`):**
 
 **HTTP request parsing (use `httparse`):**
 
@@ -895,126 +926,96 @@ let parsed = loop {
 6. Binary garbage → connection dropped
 7. Fragmented valid request (multi-read) → succeeds
 
-### 5.2 Connection Protocol
+### 5.2 Connection Protocol (As-Built)
 
 **On WebSocket connect, server immediately sends:**
 ```json
-{ "type": "init", "graph": {...}, "dot": "...", "status": {...}, "events": [...], "dropped_events": 0 }
+{ "type": "init", "graph": {...}, "status": {...} }
 ```
 
-The `dropped_events` field reports the cumulative count of events dropped at the `try_send` boundary (§3.9). This is included in both the initial `init` message and periodically in status updates, allowing the UI to display an observability indicator.
+The `graph` field is the full Forge `Graph` JSON (nodes, edges, attrs). The `status` field is the current `WatchStatus` enum serialized with the `state` tag field.
 
-The `events` array contains all events from the current run (bounded ring buffer, capacity 4096). For large runs, the `events` array may be truncated — clients should handle partial history gracefully.
-
-**Large init payload batching:** If the serialized init payload exceeds 1 MB, send in chunks:
-1. `{ "type": "init_meta", "graph": {...}, "dot": "...", "status": {...}, "dropped_events": 0, "total_events": 3500 }` — metadata without events
-2. `{ "type": "init_events", "events": [...batch of 500...], "batch": 1, "total_batches": 7 }` — event chunks
-3. ...more `init_events` messages...
-4. `{ "type": "init_complete" }` — signals that all historical events have been sent; client can transition to live mode
-
-Clients MUST buffer `init_events` batches and apply them in order before processing live events. If a client receives a live `event` message before `init_complete`, it should queue it for processing after init completes.
+Immediately after the `init` message, the server sends all buffered events from the `EventLog`:
+```json
+{ "type": "event", "seq": 1, "data": { "timestamp": "...", "kind": {...} } }
+```
+Events are sent one message per event, each with a monotonically increasing `seq` assigned by the `EventLog`. After all buffered events are sent, the connection transitions to live mode — new events are pushed as they arrive.
 
 **Pipeline events (server → client):**
 ```json
-{ "type": "event", "seq": 1, "run_id": "abc123", "data": { "timestamp": "...", "kind": {...} } }
+{ "type": "event", "seq": 42, "data": { "timestamp": "...", "kind": {...} } }
 ```
 
-Every event includes a monotonically increasing `seq` number and a `run_id` for resumability.
+The `seq` is a u64 assigned by the `EventLog::push()` method. The `data` field is the full `RuntimeEvent` JSON (timestamp + kind). There is no `run_id` field in the current implementation.
 
-**Event ordering guarantee:** Events are assigned `seq` atomically with insertion into the ring buffer and broadcast:
-1. Increment `seq` counter (atomic)
-2. Insert into ring buffer (under lock)
-3. Broadcast to subscribers
+**Event ordering guarantee:** Events are assigned `seq` inside the `EventLog::push()` call, which is guarded by `std::sync::Mutex`. The lock is held for the duration of push. The `Notify::notify_waiters()` call follows the lock release, so clients are woken after the event is committed to the log.
 
-**Control commands (client → server):**
-```json
-{ "type": "control", "action": "start|pause|resume|stop" }
-```
+**EventLog ring buffer:** The `EventLog` stores events in a `Vec<(u64, String)>` (sequence number + JSON string). Capacity is bounded to 10,000 events; when it exceeds this, the oldest 5,000 are drained. On reconnect, the WS client loop calls `EventLog::since(0)` to replay all buffered events.
 
-**Control responses (server → client):**
-```json
-{ "type": "control_ack", "action": "start", "ok": true, "error": null }
-```
+**Control actions:** Control buttons in the HTML page (`start`, `pause`, `resume`, `stop`) send requests via HTTP `fetch()` to the REST endpoints (see §5.5). They are NOT sent over the WebSocket in the current implementation.
 
-**Resume (client → server, for reconnection):**
-```json
-{ "type": "resume", "last_seq": 42, "run_id": "abc123" }
-```
+**Keepalive:** If no new events arrive within 15 seconds, the server sends a WebSocket `ping` frame. The WS client loop re-checks after each Notify wakeup or 15-second timeout.
 
-Server validates the `run_id` matches the current run. If `run_id` differs (server restarted with new run), server sends a full `init` message instead of replaying.
+**Target protocol extensions (deferred to post-Phases 1–4):**
+- `run_id` field in events for cross-session resumability
+- `resume` message from client (last_seq + run_id) for catch-up after reconnect
+- `dropped_events` counter in `init` message for observability
+- Control commands via WebSocket (replacing REST fetch)
+- Per-run auth token (embedded in HTML, validated on WS upgrade)
 
-**Resume atomicity (pre-subscribe approach):** The challenge is preventing events from being lost between ring buffer replay and broadcast subscription:
+### 5.3 Security Constraints (As-Built)
 
-1. **Subscribe to broadcast first** — `broadcast_rx = broadcast_tx.subscribe()`. The receiver starts buffering from this point.
-2. Read ring buffer events with `seq > last_seq` under lock. Record the ring buffer's max `seq` as `replay_max`.
-3. Send all replayed events to the client.
-4. **Drain broadcast**: receive from `broadcast_rx`, skip any events with `seq <= replay_max` (already replayed). Forward all events with `seq > replay_max`.
-5. Transition to normal operation — all subsequent broadcast events are forwarded.
+**Path sanitization (implemented):**
+- `node_id` is checked for `..`, `/`, and `\` characters. Requests containing path traversal characters return 400.
+- `file` must be in the allowlist: `["prompt.md", "response.md", "status.json"]`.
+- The resolved path is `logs_root / node_id / filename`. Files are read with `std::fs::read()`.
+- No TOCTOU hardening (no `/proc/self/fd` canonicalize verification) in the current implementation.
+- Maximum response size: unbounded in current implementation (reads entire file).
 
-This guarantees no gap because the broadcast subscription starts buffering *before* the ring buffer read.
+**Bind address:** Configurable via `--bind` argument (default: `127.0.0.1`). No `--unsafe-bind` enforcement or non-localhost warnings are implemented.
 
-**Artifact requests (client → server):**
-```json
-{ "type": "artifact_request", "node_id": "plan", "file": "response.md" }
-```
+**Authentication:** No per-run auth token is implemented. The WebSocket endpoint (`/ws`) accepts any connection without authentication. The REST endpoints (`/api/*`) also accept unauthenticated requests. This is acceptable for the current development-tool use case (localhost only by default).
 
-**Artifact responses (server → client):**
-```json
-{ "type": "artifact", "node_id": "plan", "file": "response.md", "content": "..." }
-```
+**Rate limiting:** Not implemented.
 
-### 5.3 Security Constraints
+**Target security hardening (deferred to post-Phase 5 or separate PR):**
+- Per-run auth token embedded in HTML, validated on WS upgrade (see original §5.3 target design above)
+- `--unsafe-bind` flag for non-localhost with warning
+- `node_id` regex validation (`^[a-zA-Z0-9_-]+$`)
+- Maximum artifact response size (10 MB)
+- Rate limiting (10 concurrent WS connections, 60 control commands/min)
+- TOCTOU-safe path validation via `/proc/self/fd` readlink
 
-**Path sanitization (required for artifact serving):**
-- `node_id` must match `^[a-zA-Z0-9_-]+$` (no path separators, no dots)
-- `file` must be in an explicit allowlist: `["response.md", "prompt.md", "status.json", "stdout.log", "stderr.log"]`
-- The resolved path must be a descendant of `logs_root`. **Linux-specific hardening:** Use `std::fs::File::open()` on the constructed path, then verify the opened file's canonical path via `fd.metadata()` + `/proc/self/fd/N` readlink to prevent TOCTOU races. Alternatively, use `openat` with `O_NOFOLLOW` to refuse symlinks. **Cross-platform fallback:** `std::fs::canonicalize(&path)` + prefix check that the canonical path starts with `logs_root`. This is slightly weaker (TOCTOU window between canonicalize and open) but works on all platforms. Since the watch server currently targets Linux only, the `/proc/self/fd` approach is preferred.
-- Maximum response size: 10 MB — enforced by reading up to 10 MB + 1 byte; if the read returns more than 10 MB, respond with an error.
-
-**Per-run authentication token:**
-- On startup, the watch server generates a random 32-byte token (hex-encoded, 64 chars)
-- The token is embedded directly in the served HTML page as a JavaScript variable (not in the URL): `<script>const WS_TOKEN = "...";</script>`
-- The HTML page includes the token in the WebSocket URL: `ws://host:port/ws?token=XXXX`
-- The server validates the token on WebSocket upgrade; reject with 403 if missing or mismatched
-- **Token is printed to stderr** alongside the URL for CLI access: `Watch: http://127.0.0.1:PORT (token: XXXX)`
-- This prevents browser-based CSRF attacks on localhost
-
-**Note on token in query string:** The WS URL contains the token as a query parameter. This is acceptable because: (1) WebSocket URLs are not stored in browser history, (2) there are no referrer headers on WS connections, (3) the token is per-run and short-lived. For additional defense-in-depth, the token could be sent as the first WS message instead of in the URL.
-
-**Non-localhost bind policy:**
-- **Default:** The watch server ONLY binds to `127.0.0.1` (localhost). This is the safe default.
-- **Explicit opt-in:** Non-loopback binds (e.g., `0.0.0.0`, public IP) require `--unsafe-bind` flag. Without this flag, binding to non-localhost addresses is **rejected with an error**.
-- When `--unsafe-bind` is used:
-  - **WARNING log** emitted at startup: "WARNING: Binding to non-localhost address. The watch server token is accessible to anyone who can reach this port."
-  - Validate the `Origin` header on WebSocket upgrade
-  - Token authentication still applies, but note that any client that can fetch `GET /` obtains the token from the embedded HTML
-  - For production remote access, use a reverse proxy with TLS (e.g., Caddy) rather than exposing the watch server directly
-
-**Rate limiting:**
-- Maximum 10 concurrent WebSocket connections per server instance
-- Maximum 60 control commands per minute per connection (1/second average)
-- Artifact requests: maximum 30 per minute per connection
-
-### 5.4 Event Flow
+### 5.4 Event Flow (As-Built)
 
 ```
-Pipeline Engine
-    │
-    │  (async — same runtime)
+std::thread: "forge-watch-pipeline"
+    │  (tokio runtime — PipelineRunner)
+    │  RuntimeEventSink::emit() → tokio mpsc tx
     ▼
-mpsc::Sender (try_send)  ◄── emit_runtime_event() — sync, no Cx needed
-    │
+std::thread: "forge-watch-bridge"
+    │  (tokio runtime — bridge_loop)
+    │  tokio mpsc rx.recv().await
+    │  → serde_json::to_string(event)
+    │  → EventLog::push(json)  [std::sync::Mutex]
+    │  → Notify::notify_waiters()  [asupersync Notify, cross-runtime safe]
     ▼
-Bridge Task (mpsc recv → broadcast send)
-    │                        ▲
-    │  broadcast::Sender     │  Ring Buffer append (atomic seq)
-    │                        │
-    ├── broadcast::Receiver ──► WS Client Task 1 ──► ws.send(Message::text(json))
-    ├── broadcast::Receiver ──► WS Client Task 2 ──► ws.send(Message::text(json))
-    └── broadcast::Receiver ──► WS Client Task N ──► ws.send(Message::text(json))
-
-    EventLog (ring buffer, capacity 4096) ◄── stores events for replay on reconnect
+asupersync runtime (main thread)
+    │
+    ├── WS Client Task 1 (handle.try_spawn)
+    │     ws_client_loop:
+    │       1. send init message (graph + status)
+    │       2. send all EventLog events since seq=0
+    │       3. loop:
+    │            poll EventLog::since(last_seq)
+    │            if new events → send each, update last_seq
+    │            else wait: Notify.notified() OR timeout(15s) + ping
+    │
+    ├── WS Client Task 2 ...
+    └── WS Client Task N ...
 ```
+
+**EventLog access pattern:** Each WS client task holds its own `last_seq: u64`. On each loop iteration it acquires `std::sync::Mutex<EventLog>` briefly, collects new events since `last_seq`, releases the lock, then sends the events over the WebSocket. The `Notify::notify_waiters()` in the bridge thread wakes all waiting client tasks simultaneously — zero-polling, Notify-driven delivery.
 
 **Per-client WebSocket task (single owner, no split):**
 
@@ -1024,79 +1025,71 @@ Bridge Task (mpsc recv → broadcast send)
 - `pub async fn send(&mut self, cx: &Cx, msg: Message) -> Result<(), WsError>`
 - `pub async fn recv(&mut self, cx: &Cx) -> Result<Option<Message>, WsError>` — returns `None` on clean close
 
-**Design: Single WS owner with Notify-based wake.**
+**Note on WS recv in as-built implementation:** The current `ws_client_loop` does NOT call `ws.recv()` — it only sends events from the `EventLog`. Client-to-server messages (control actions) go via the HTTP REST endpoints instead. The client loop uses a Notify-with-timeout pattern rather than the Select-based approach described in the original target design. The target design below (§5.6) describes the Select-based approach for the fully-unified post-Phase-5 implementation.
 
-The event forwarder task signals when outbound messages are available, waking the main loop immediately instead of polling:
+**As-built `ws_client_loop` pattern:**
+```rust
+async fn ws_client_loop(cx: &Cx, ws: &mut ServerWebSocket<TcpStream>, state: &AppState) {
+    let mut last_seq: u64 = 0;
+
+    // 1. Send init message
+    let init = json!({ "type": "init", "graph": &state.graph, "status": ... });
+    ws.send(cx, Message::text(init.to_string())).await?;
+
+    // 2. Replay all buffered events
+    let buffered = state.event_log.lock().unwrap().since(0).collect::<Vec<_>>();
+    for (seq, json) in buffered {
+        ws.send(cx, Message::text(format!(r#"{{"type":"event","seq":{seq},"data":{json}}}"#))).await?;
+        last_seq = seq;
+    }
+
+    // 3. Live event loop
+    loop {
+        if state.shutdown.load(Ordering::Acquire) { /* close */ return; }
+
+        let new_events = state.event_log.lock().unwrap().since(last_seq).collect::<Vec<_>>();
+        for (seq, json) in new_events {
+            ws.send(cx, Message::text(format!(r#"{{"type":"event","seq":{seq},"data":{json}}}"#))).await?;
+            last_seq = seq;
+        }
+
+        if no_new_events {
+            match timeout(wall_now(), Duration::from_secs(15), state.event_notify.notified()).await {
+                Ok(()) => {} // woken by new event — loop
+                Err(_)  => { ws.ping(...).await?; } // 15s timeout — send keepalive ping
+            }
+        }
+    }
+}
+```
+
+**Target design with Select (deferred to post-Phases 1–4):**
+
+The original target design — a single-owner WS loop using `Select` to race `ws.recv()` against `Notify::notified()` — is still the right end-state. It adds bidirectional messaging over WS (replacing REST fetch for control actions). This is deferred until all crates are on asupersync:
 
 ```rust
-async fn handle_ws_client(
-    cx: &Cx,
-    mut ws: ServerWebSocket,
-    broadcast_tx: &broadcast::Sender<String>,
-    app_state: &AppState,
-) -> Result<()> {
-    let mut broadcast_rx = broadcast_tx.subscribe();
-    let (out_tx, mut out_rx) = mpsc::channel::<String>(128);
-    let wake_notify = Arc::new(Notify::new());
-    let wake_for_events = wake_notify.clone();
+// Post-unification: bidirectional WS loop (target, not yet implemented)
+loop {
+    // Drain all pending outbound messages (non-blocking)
+    while let Ok(msg) = out_rx.try_recv() {
+        ws.send(cx, Message::text(msg)).await?;
+    }
 
-    // Send init message
-    let init_json = build_init_message(app_state);
-    ws.send(cx, Message::text(init_json)).await?;
+    // Wait for either: client message OR outbound queue notification
+    // Use Select to race ws.recv against wake_notify
+    let ws_recv_fut = ws.recv(cx);
+    let wake_fut = wake_notify.notified();
 
-    // Spawn event forwarder — receives broadcast events, queues for sending, wakes main loop
-    // NOTE: handle.spawn() returns JoinHandle<T> which does NOT have abort() (verified —
-    // only TaskHandle from scope.spawn has abort). Use a shutdown Notify to signal exit.
-    let forwarder_shutdown = Arc::new(Notify::new());
-    let forwarder_shutdown_rx = forwarder_shutdown.clone();
-    let out_tx_clone = out_tx.clone();
-    let cx_clone = cx.clone();
-    let forwarder = app_state.handle.spawn(async move {
-        loop {
-            // Race: broadcast recv vs shutdown signal
-            let recv_fut = broadcast_rx.recv(&cx_clone);
-            let shutdown_fut = forwarder_shutdown_rx.notified();
-            match Select::new(std::pin::pin!(recv_fut), std::pin::pin!(shutdown_fut)).await {
-                Either::Left(Ok(event_json)) => {
-                    if out_tx_clone.try_send(event_json).is_err() {
-                        break;  // Client's outbound queue full
-                    }
-                    wake_for_events.notify_one();
-                }
-                Either::Left(Err(broadcast::RecvError::Lagged(n))) => {
-                    let lag = format!(r#"{{"type":"lag","missed":{n}}}"#);
-                    let _ = out_tx_clone.try_send(lag);
-                    wake_for_events.notify_one();
-                }
-                Either::Left(Err(broadcast::RecvError::Closed))
-                | Either::Left(Err(broadcast::RecvError::Cancelled))
-                | Either::Right(()) => break,  // shutdown or channel closed
-            }
+    match Select::new(ws_recv_fut, wake_fut).await {
+        Either::Left(Ok(Some(Message::Text(cmd)))) => {
+            let resp = handle_client_command(app_state, &cmd);
+            ws.send(cx, Message::text(resp)).await?;
         }
-    });
-
-    // Main loop: WS owner alternates between draining outbound queue and receiving client messages
-    loop {
-        // Drain all pending outbound messages (non-blocking)
-        while let Ok(msg) = out_rx.try_recv() {
-            ws.send(cx, Message::text(msg)).await?;
-        }
-
-        // Wait for either: client message OR outbound queue notification
-        // Use Select to race ws.recv against wake_notify
-        let ws_recv_fut = ws.recv(cx);
-        let wake_fut = wake_notify.notified();
-
-        match Select::new(ws_recv_fut, wake_fut).await {
-            Either::Left(Ok(Some(Message::Text(cmd)))) => {
-                let resp = handle_client_command(app_state, &cmd);
-                ws.send(cx, Message::text(resp)).await?;
-            }
-            Either::Left(Ok(Some(Message::Close(_)))) | Either::Left(Ok(None)) => break,
-            Either::Left(Err(e)) => return Err(e.into()),
-            Either::Right(()) => {
-                // Notified — loop back to drain outbound queue
-                continue;
+        Either::Left(Ok(Some(Message::Close(_)))) | Either::Left(Ok(None)) => break,
+        Either::Left(Err(e)) => return Err(e.into()),
+        Either::Right(()) => {
+            // Notified — loop back to drain outbound queue
+            continue;
             }
             _ => {} // ignore binary frames
         }
@@ -1116,23 +1109,60 @@ This design has **zero polling** — the `Select` blocks until either a client m
 
 **Note on `Cx` in event forwarder:** The forwarder uses `cx.clone()` (Cx is Clone + Send + Sync, verified at cx.rs:151). When the parent scope closes, the broadcast `recv` will return `Cancelled`, causing the forwarder to exit. This maintains the cancellation tree — no orphaned tasks.
 
-### 5.5 No HTTP REST API
+### 5.5 HTTP REST Endpoints (As-Built)
 
-The following endpoints are **removed** in favor of WebSocket messages:
+**Note:** The original design called for removing all REST endpoints in favor of WebSocket messages. In the as-built implementation, REST endpoints are **retained**. The HTML page uses `fetch()` for control actions and artifact loading, while only event streaming uses WebSocket. This is an intentional pragmatic tradeoff for the transitional state.
 
-| Old HTTP Endpoint | New WebSocket Message |
-|-------------------|----------------------|
-| `GET /api/graph` | Included in `init` message on connect |
-| `GET /api/dot` | Included in `init` message on connect |
-| `GET /api/status` | Included in `init` message on connect |
-| `GET /api/events?after=N` | Real-time push via broadcast channel + `resume` for catch-up |
-| `GET /api/artifacts/{node}/{file}` | `artifact_request` → `artifact` response |
-| `POST /api/control/start` | `{ "type": "control", "action": "start" }` |
-| `POST /api/control/pause` | `{ "type": "control", "action": "pause" }` |
-| `POST /api/control/resume` | `{ "type": "control", "action": "resume" }` |
-| `POST /api/control/stop` | `{ "type": "control", "action": "stop" }` |
+| HTTP Endpoint | Purpose |
+|---------------|---------|
+| `GET /` | Serve static HTML page (watch.html) |
+| `GET /api/graph` | Current graph as JSON |
+| `GET /api/dot` | Original DOT source |
+| `GET /api/status` | Current `WatchStatus` as JSON |
+| `GET /api/artifacts/{node}/{file}` | Serve artifact file (prompt.md, response.md, status.json) |
+| `POST /api/control/start` | Trigger deferred pipeline start |
+| `POST /api/control/pause` | Pause pipeline via `PipelineControl` |
+| `POST /api/control/resume` | Resume pipeline via `PipelineControl` |
+| `POST /api/control/stop` | Cancel pipeline via `PipelineControl` |
+| `GET /ws` | WebSocket upgrade — real-time event stream |
 
-The only HTTP endpoint is `GET /` which serves the static HTML page.
+**HTML uses fetch() for artifacts and controls:** The `fetchArtifact()` function in watch.html calls `GET /api/artifacts/{node}/{file}` via `fetch()`. The control buttons call `POST /api/control/{action}` via `fetch()`. After a control action, the HTML re-fetches `GET /api/status` to refresh the UI.
+
+**Target (deferred):** After full runtime unification (post-Phases 1–4), control commands and artifact requests should migrate to WebSocket messages (`control` and `artifact_request`/`artifact` message types), and the REST endpoints except `GET /` can be removed. The HTML would receive status updates via the existing `init` + `event` messages rather than polling.
+
+### 5.6 Target Single-Runtime Architecture (Post-Phases 1–4)
+
+After all crates are on asupersync, the pipeline and bridge threads are eliminated. Everything runs on the single asupersync `current_thread` runtime:
+
+```
+                    ┌─────────────────────────────────────────┐
+                    │        asupersync runtime                │
+                    │   RuntimeBuilder::current_thread()       │
+                    │   .blocking_threads(2, 16)               │
+                    │                                          │
+                    │  ┌─────────────┐  ┌───────────────────┐ │
+                    │  │  TCP/WS     │  │  Pipeline Engine  │ │
+                    │  │  Server     │  │  (scope.spawn)    │ │
+                    │  └──────┬──────┘  └────────┬──────────┘ │
+                    │         │                  │            │
+                    │         │   EventLog +     │ emit()     │
+                    │         │   Notify         │ try_send   │
+                    │         │◄──bridge task────┘            │
+                    │         │   (mpsc rx → EventLog push)   │
+                    │  ┌──────▼──────┐                        │
+                    │  │  WS Clients │  (handle.try_spawn)    │
+                    │  │  (N tasks)  │                        │
+                    │  └─────────────┘                        │
+                    └─────────────────────────────────────────┘
+```
+
+In the target architecture:
+- Pipeline engine runs as a scoped task on the asupersync runtime via `scope.spawn`.
+- The event bridge runs as an inline asupersync task (mpsc `rx.recv(&cx).await` → EventLog push → Notify).
+- WS client tasks are spawned via `handle.try_spawn`.
+- Control actions arrive via WS message and are dispatched inline in the WS client loop using `Select` (see §5.4 target design).
+- Signal handling uses `spawn_blocking` + `signal_hook` (see §6.1).
+- No `std::thread::spawn` except the §6.3 shutdown safety valve.
 
 ## 6. Graceful Shutdown
 
@@ -1354,6 +1384,25 @@ This is the second-largest migration (156 `tokio::` call sites, 142 `#[tokio::te
 
 By this phase, ALL downstream crates are on asupersync. No bridge needed.
 
+#### 5b. Watch server rewrite (`src/watch.rs`) — COMPLETE
+
+**Status: Complete.** The watch server has been rewritten. Key changes implemented:
+- Replaced `Http1Listener` + SSE sink with raw `TcpListener` + `httparse`-based HTTP parsing + `WebSocketAcceptor`.
+- Added `EventLog` ring buffer (Vec-based, capacity 10k, drains to 5k when full).
+- WS client loop uses asupersync `Notify` for zero-poll event delivery with 15-second keepalive ping.
+- asupersync `RuntimeBuilder::current_thread()` for the TCP/WS server.
+- `httparse` added as a dependency.
+- Replaced Graphviz WASM + EventSource-based HTML with Cytoscape.js + dagre layout + Split.js + native WebSocket.
+
+**Deviations from original Phase 5b spec:**
+- Pipeline and event bridge still run on separate tokio threads (not asupersync tasks). This is because Phases 1–4 (converting forge-attractor, forge-agent, etc.) are not yet complete.
+- No per-run auth token (deferred).
+- No rate limiting (deferred).
+- REST endpoints retained (see §5.5). Control actions and artifact fetching still use HTTP fetch, not WS messages.
+- `broadcast::channel` NOT used — WS clients poll `EventLog` on `Notify` wakeup instead.
+- `Cx::for_testing()` used instead of `Cx::for_request()` in the asupersync runtime block (acceptable for now; must be fixed in full Phase 5 completion).
+- Signal handling uses a `std::thread` + `libc::signal` pattern (not `signal_hook` + `spawn_blocking`).
+
 **Changes:**
 
 #### 5a. Runtime entry point (`src/main.rs`)
@@ -1362,22 +1411,23 @@ By this phase, ALL downstream crates are on asupersync. No bridge needed.
 3. Replace `runtime.block_on(async { ... })` — add `Cx::for_request()` + scope creation at the top.
 4. Restructure `run_command` and `resume_command` to use `scope.region`.
 
-#### 5b. Watch server rewrite (`src/watch.rs`)
-1. Replace `Http1Listener` with raw `TcpListener` + `httparse`-based HTTP parsing with incremental read loop (see §5.1).
-2. For `GET /` requests: serve HTML with embedded token.
-3. For WebSocket upgrade: validate token, use `WebSocketAcceptor::accept(&cx, request_bytes, stream)`.
-4. Remove all long-poll SSE infrastructure.
-5. Add `broadcast::channel(4096)` for event fan-out.
-6. Add `EventLog` ring buffer (capacity 4096) with atomic seq ordering.
-7. Each WS client uses single-owner loop with Notify-based wake (see §5.4 — **no split**).
-8. Pipeline runs as a spawned scope task on the same runtime.
-9. Bridge task: mpsc recv → assign seq → append to ring buffer → broadcast.
-10. Implement per-run auth token (§5.3) + rate limiting.
+#### 5b. Watch server rewrite (`src/watch.rs`) — remaining work
+1. ~~Replace `Http1Listener` with raw `TcpListener` + `httparse`-based HTTP parsing~~ ✓ Done
+2. ~~Remove all long-poll SSE infrastructure~~ ✓ Done
+3. ~~Add `EventLog` ring buffer~~ ✓ Done (Vec-based, 10k cap)
+4. ~~Each WS client uses single-owner loop with Notify-based wake~~ ✓ Done
+5. Migrate pipeline from separate tokio thread to asupersync scope task (requires Phases 1–4 first)
+6. Migrate bridge from tokio thread to asupersync bridge task (requires Phases 1–4 first)
+7. Implement per-run auth token (§5.3) + rate limiting
+8. Replace `Cx::for_testing()` with `Cx::for_request()` at entry point
+9. Migrate signal handling to `signal_hook` + `spawn_blocking` pattern (§6.1)
+10. Migrate control actions to WS messages (replacing REST fetch)
+11. Replace `broadcast::channel` placeholder with actual broadcast fan-out once bridge is async
 
-#### 5c. Watch HTML rewrite (`src/watch.html`)
-1. Replace fetch-based long-poll with native `WebSocket` + reconnection logic.
-2. Read token from embedded JS variable.
-3. Handle `lag` messages by sending `resume` with `last_seq` and `run_id`.
+#### 5c. Watch HTML rewrite (`src/watch.html`) — COMPLETE
+1. ~~Replace fetch-based long-poll + Graphviz WASM + EventSource with native WebSocket + Cytoscape.js + dagre~~ ✓ Done
+2. Auto-reconnect with exponential backoff on WS close ✓ Done
+3. Remaining: token integration, `resume`/`lag` message handling (deferred with auth token)
 
 #### 5d. Signal handling
 1. Use `spawn_blocking` with `signal_hook` (see §6.1).
@@ -1385,10 +1435,10 @@ By this phase, ALL downstream crates are on asupersync. No bridge needed.
 3. Implement shutdown timeout via race pattern (§6.3).
 
 #### 5e. Cleanup
-1. `forge-cli/Cargo.toml`: Remove tokio, add `signal_hook`, `httparse`.
+1. `forge-cli/Cargo.toml`: Remove tokio (currently retained for pipeline/bridge threads), add `httparse` ✓ Done. `signal_hook` deferred.
 2. `forge-cli/tests/e2e_pipeline.rs`: Replace tokio runtime with asupersync.
 
-**Tests:** forge-cli smoke tests pass. Manual E2E: WebSocket + token + events + resume + artifacts.
+**Tests:** forge-cli smoke tests pass. Manual E2E: WebSocket + events + artifacts + control actions verified working.
 
 **Rollback:** Revert PR.
 
@@ -1409,7 +1459,19 @@ By this phase, ALL downstream crates are on asupersync. No bridge needed.
 
 ## 8. Dependency Changes
 
-### Removed
+### Current State (Phase 5b complete)
+
+| Crate | Status |
+|-------|--------|
+| forge-cli | Added: `asupersync = "0.2.6"`, `httparse = "1"`, `libc = "0.2"`. Retained: `tokio` (for pipeline + bridge threads, pending Phases 1–4). |
+| forge-attractor | Unchanged — tokio still primary runtime |
+| forge-agent | Unchanged — tokio still primary runtime |
+| forge-llm | Unchanged — tokio still primary runtime |
+| forge-cxdb-runtime | Unchanged — tokio still in dev-dependencies |
+
+### Target State (all phases complete)
+
+#### Removed
 | Crate | Removed Dependency |
 |-------|--------------------|
 | forge-attractor | `tokio`, `futures` (if only channel was used) |
@@ -1420,7 +1482,7 @@ By this phase, ALL downstream crates are on asupersync. No bridge needed.
 
 **Note on `futures-util`:** Retained in `forge-llm` (required for `StreamExt::next()` on `FramedRead` streams in CLI adapters, and `BoxFuture` in trait returns). May also be retained in `forge-agent` — check during Phase 3.
 
-**Note on `libc`:** Retained in `forge-llm` (needed for process group management via `setpgid`/`killpg` in CLI adapter timeout cleanup). Removed from `forge-cli` (process management is in forge-llm, not forge-cli).
+**Note on `libc`:** Retained in `forge-cli` (current signal handling) and `forge-llm` (process group management via `setpgid`/`killpg`). After Phase 5 completion, `forge-cli` signal handling migrates to `signal_hook` + `spawn_blocking`; `libc` stays in `forge-llm` for process groups.
 
 ### Added / Updated
 | Crate | Added Dependency |
@@ -1476,23 +1538,25 @@ asupersync = { version = "0.2.6", features = ["test-internals"] }
 
 ## 11. Success Criteria
 
-1. `cargo build` succeeds with zero direct tokio dependencies in Forge crates (excluding forge-cxdb vendored crate).
-2. `cargo test` — all existing tests pass (282 migrated test macros).
-3. `cargo test --ignored` — all live provider tests pass.
-4. `forge-cli watch` — WebSocket works: init with token, real-time events, control commands, artifact requests, reconnection with `resume` + `run_id`.
-5. `forge-cli run` — pipelines execute correctly on asupersync runtime.
-6. `forge-cli resume` — checkpoint resume works.
-7. Binary size reduction from dependency elimination (measured, not targeted).
-8. No explicit `std::thread::spawn` calls in forge-cli watch except the §6.3 shutdown safety valve. (Note: `spawn_blocking` internally uses the blocking thread pool — this is expected and does not count.)
-9. `RecvError::Lagged` handled gracefully in all broadcast consumers.
-10. All `child.wait()` calls use `spawn_blocking`.
-11. Performance: mock pipeline time not regressed >10%.
-12. Graceful shutdown: Ctrl+C causes clean exit within 5 seconds.
-13. Security: WebSocket auth token, path validation, rate limiting.
-14. All production Cargo.toml use `default-features = false` for asupersync.
-15. No `Cx::for_request()` stubs remain — all Cx instances flow from root.
-16. Dropped-event counter exposed via watch UI.
-17. `JoinError::Cancelled` and `JoinError::Panicked` preserved as distinct error variants.
+Progress legend: ✓ = done, ◐ = partial, ○ = not started
+
+1. ○ `cargo build` succeeds with zero direct tokio dependencies in Forge crates (excluding forge-cxdb vendored crate). *(tokio retained in forge-cli and all upstream crates pending Phases 1–4)*
+2. ○ `cargo test` — all existing tests pass (282 migrated test macros). *(not yet migrated)*
+3. ○ `cargo test --ignored` — all live provider tests pass. *(not yet migrated)*
+4. ◐ `forge-cli watch` — WebSocket works: real-time events, control actions, artifact requests, auto-reconnect. **WS events and graph visualization: ✓ done.** Missing: auth token, resume with run_id, WS-native control commands.
+5. ○ `forge-cli run` — pipelines execute correctly on asupersync runtime. *(main.rs still uses tokio)*
+6. ○ `forge-cli resume` — checkpoint resume works. *(main.rs still uses tokio)*
+7. ○ Binary size reduction from dependency elimination (measured, not targeted).
+8. ○ No explicit `std::thread::spawn` calls in forge-cli watch except the §6.3 shutdown safety valve. *(two std::thread spawns for pipeline + bridge remain)*
+9. ○ `RecvError::Lagged` handled gracefully in all broadcast consumers. *(broadcast not yet used)*
+10. ○ All `child.wait()` calls use `spawn_blocking`. *(forge-llm not yet migrated)*
+11. ○ Performance: mock pipeline time not regressed >10%.
+12. ◐ Graceful shutdown: Ctrl+C causes clean exit within 5 seconds. *(SIGINT handler implemented via libc::signal + AtomicBool; not yet using signal_hook + spawn_blocking)*
+13. ○ Security: WebSocket auth token, path validation, rate limiting. *(basic node_id/filename validation done; no token, no rate limiting)*
+14. ○ All production Cargo.toml use `default-features = false` for asupersync. *(forge-cli currently uses `asupersync = "0.2.6"` without `default-features = false`)*
+15. ○ No `Cx::for_request()` stubs remain — all Cx instances flow from root. *(forge-cli watch uses `Cx::for_testing()`)*
+16. ○ Dropped-event counter exposed via watch UI.
+17. ○ `JoinError::Cancelled` and `JoinError::Panicked` preserved as distinct error variants.
 
 ## 12. Appendix: asupersync Feature Requirements
 

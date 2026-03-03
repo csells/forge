@@ -1601,7 +1601,7 @@ Implementations may expose the pipeline engine as an HTTP service for web-based 
 |--------|-----------------------------------------|-------------|
 | `POST` | `/pipelines`                            | Submit a DOT source and start execution. Returns pipeline ID. |
 | `GET`  | `/pipelines/{id}`                       | Get pipeline status and progress. |
-| `GET`  | `/pipelines/{id}/events`                | SSE stream of pipeline events in real-time. |
+| `GET`  | `/pipelines/{id}/events`                | WebSocket stream of pipeline events in real-time. (Prefer WebSocket over SSE per spec/07.) |
 | `POST` | `/pipelines/{id}/cancel`                | Cancel a running pipeline. |
 | `GET`  | `/pipelines/{id}/graph`                 | Get rendered graph visualization (SVG). |
 | `GET`  | `/pipelines/{id}/questions`             | Get pending human interaction questions. |
@@ -1609,7 +1609,7 @@ Implementations may expose the pipeline engine as an HTTP service for web-based 
 | `GET`  | `/pipelines/{id}/checkpoint`            | Get current checkpoint state. |
 | `GET`  | `/pipelines/{id}/context`               | Get current context key-value store. |
 
-Human gates must be operable via web controls in addition to CLI. The server maintains SSE connections for real-time event streaming.
+Human gates must be operable via web controls in addition to CLI. The server maintains WebSocket connections for real-time event streaming. (SSE was the original design; WebSocket is the adopted approach per spec/07 §5.)
 
 ### 9.6 Observability and Events
 

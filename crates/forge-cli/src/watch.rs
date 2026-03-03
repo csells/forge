@@ -10,12 +10,17 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-// Asupersync HTTP server
-use asupersync::http::h1::listener::Http1Listener;
-use asupersync::http::h1::types::{Request as H1Request, Response as H1Response};
-use asupersync::runtime::RuntimeBuilder;
+// Asupersync
+use asupersync::Cx;
+use asupersync::io::{AsyncRead, AsyncWriteExt};
+use asupersync::net::TcpListener;
+use asupersync::net::TcpStream;
+use asupersync::net::websocket::{WebSocketAcceptor, ServerWebSocket, Message};
+use asupersync::runtime::{RuntimeBuilder, RuntimeHandle};
+use asupersync::sync::Notify;
 
 // ---------------------------------------------------------------------------
 // Shared application state (uses std::sync — works across runtimes)
@@ -28,13 +33,14 @@ struct AppState {
     status: RwLock<WatchStatus>,
     control: Arc<PipelineControl>,
     start_trigger: Mutex<Option<std::sync::mpsc::Sender<()>>>,
-    /// Ring buffer of events for SSE long-poll. Clients send `?after=<seq>` to
-    /// get events with sequence > seq.
+    /// Ring buffer of events. WS clients track their own position.
     event_log: Mutex<EventLog>,
-    /// Notify waiting SSE clients that new events arrived.
-    event_notify: std::sync::Condvar,
-    /// Dummy mutex for condvar (condvar needs a mutex guard).
-    event_notify_lock: Mutex<()>,
+    /// Wakes WS client tasks when new events arrive.
+    event_notify: Arc<Notify>,
+    /// Signal for server shutdown.
+    shutdown: AtomicBool,
+    /// Handle for spawning WS client tasks.
+    handle: Mutex<Option<RuntimeHandle>>,
 }
 
 struct EventLog {
@@ -58,16 +64,12 @@ impl EventLog {
         seq
     }
 
-    fn since(&self, after_seq: u64) -> Vec<&str> {
+    fn since(&self, after_seq: u64) -> Vec<(u64, &str)> {
         self.events
             .iter()
             .filter(|(seq, _)| *seq > after_seq)
-            .map(|(_, json)| json.as_str())
+            .map(|(seq, json)| (*seq, json.as_str()))
             .collect()
-    }
-
-    fn latest_seq(&self) -> u64 {
-        self.events.last().map(|(seq, _)| *seq).unwrap_or(0)
     }
 }
 
@@ -157,8 +159,9 @@ pub fn run_sync(args: WatchArgs) -> Result<ExitCode, String> {
         control: control.clone(),
         start_trigger: Mutex::new(start_tx),
         event_log: Mutex::new(EventLog::new()),
-        event_notify: std::sync::Condvar::new(),
-        event_notify_lock: Mutex::new(()),
+        event_notify: Arc::new(Notify::new()),
+        shutdown: AtomicBool::new(false),
+        handle: Mutex::new(None),
     });
 
     // Bridge thread: reads events from tokio mpsc → pushes to event_log + updates status
@@ -192,23 +195,23 @@ pub fn run_sync(args: WatchArgs) -> Result<ExitCode, String> {
         })
         .map_err(|e| format!("failed to spawn pipeline thread: {e}"))?;
 
-    // Asupersync HTTP server
+    // Asupersync runtime — TCP listener + WebSocket server
     let addr = format!("{bind_addr}:{bind_port}");
     let runtime = RuntimeBuilder::current_thread()
         .build()
         .map_err(|e| format!("failed to build asupersync runtime: {e}"))?;
 
     let handle = runtime.handle();
-    runtime.block_on(async {
-        let handler_state = state.clone();
-        let listener = Http1Listener::bind(addr.clone(), move |req: H1Request| {
-            let st = Arc::clone(&handler_state);
-            async move { dispatch(req, &st) }
-        })
-        .await
-        .map_err(|e| format!("failed to bind {addr}: {e}"))?;
+    // Store handle so WS client tasks can be spawned
+    *state.handle.lock().unwrap() = Some(handle.clone());
 
-        eprintln!("Pipeline visualizer: http://{}", listener.local_addr().map_err(|e| e.to_string())?);
+    runtime.block_on(async {
+        let cx = Cx::for_testing();
+
+        let listener = TcpListener::bind(addr.clone()).await
+            .map_err(|e| format!("failed to bind {addr}: {e}"))?;
+        let local_addr = listener.local_addr().map_err(|e| e.to_string())?;
+        eprintln!("Pipeline visualizer: http://{local_addr}");
 
         if open_browser {
             let url = format!("http://{addr}");
@@ -219,30 +222,61 @@ pub fn run_sync(args: WatchArgs) -> Result<ExitCode, String> {
                 .spawn();
         }
 
-        // Install Ctrl+C handler (asupersync's signal::ctrl_c is Phase 0 stub)
-        let shutdown = listener.shutdown_signal();
+        // Install Ctrl+C handler
+        let shutdown_state = state.clone();
         let _ = std::thread::Builder::new()
             .name("forge-watch-signal".into())
             .spawn(move || {
-                // Use raw libc for SIGINT — simple and dependency-free
                 #[cfg(unix)]
                 {
-                    use std::sync::atomic::{AtomicBool, Ordering};
                     static SIGNALED: AtomicBool = AtomicBool::new(false);
                     unsafe {
                         libc::signal(libc::SIGINT, sigint_handler as *const () as libc::sighandler_t);
                     }
                     extern "C" fn sigint_handler(_: libc::c_int) {
-                        SIGNALED.store(true, std::sync::atomic::Ordering::Release);
+                        SIGNALED.store(true, Ordering::Release);
                     }
                     while !SIGNALED.load(Ordering::Acquire) {
                         std::thread::sleep(Duration::from_millis(100));
                     }
-                    let _ = shutdown.begin_drain(Duration::from_secs(2));
+                    shutdown_state.shutdown.store(true, Ordering::Release);
+                    // Wake any waiting WS clients so they notice shutdown
+                    shutdown_state.event_notify.notify_waiters();
                 }
             });
 
-        listener.run(&handle).await.map_err(|e| format!("server error: {e}"))?;
+        // Accept loop
+        let acceptor = WebSocketAcceptor::new();
+        loop {
+            if state.shutdown.load(Ordering::Acquire) {
+                break;
+            }
+
+            let accept_result = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(1),
+                listener.accept(),
+            ).await;
+
+            let (stream, _peer) = match accept_result {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(e)) => {
+                    eprintln!("accept error: {e}");
+                    continue;
+                }
+                Err(_) => continue, // timeout — loop back to check shutdown
+            };
+
+            let conn_state = state.clone();
+            let conn_acceptor = acceptor.clone();
+            let conn_cx = cx.clone();
+            let _ = handle.try_spawn(async move {
+                if let Err(e) = handle_connection(conn_cx, stream, &conn_state, &conn_acceptor).await {
+                    // Connection errors are expected (client disconnects, etc.)
+                    let _ = e;
+                }
+            });
+        }
 
         // Wait for pipeline and bridge to finish
         let _ = pipeline_handle.join();
@@ -250,6 +284,285 @@ pub fn run_sync(args: WatchArgs) -> Result<ExitCode, String> {
 
         Ok::<ExitCode, String>(ExitCode::SUCCESS)
     })
+}
+
+// ---------------------------------------------------------------------------
+// Connection handler: parse HTTP, dispatch to WS upgrade or HTTP response
+// ---------------------------------------------------------------------------
+
+async fn handle_connection(
+    cx: Cx,
+    mut stream: TcpStream,
+    state: &AppState,
+    acceptor: &WebSocketAcceptor,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Read raw HTTP request
+    let mut buf = vec![0u8; 8192];
+    let mut total = 0;
+
+    let request_end = loop {
+        if total >= buf.len() {
+            return write_http_error(&mut stream, 413, "Request Entity Too Large").await;
+        }
+        let n = read_some(&mut stream, &mut buf[total..]).await?;
+        if n == 0 {
+            return Ok(()); // client disconnected
+        }
+        total += n;
+        // Check for end of HTTP headers
+        if let Some(pos) = find_header_end(&buf[..total]) {
+            break pos;
+        }
+    };
+
+    // Parse with httparse
+    let mut headers = [httparse::EMPTY_HEADER; 32];
+    let mut req = httparse::Request::new(&mut headers);
+    match req.parse(&buf[..request_end]) {
+        Ok(httparse::Status::Complete(_)) => {}
+        _ => return write_http_error(&mut stream, 400, "Bad Request").await,
+    }
+
+    let method = req.method.unwrap_or("");
+    let full_path = req.path.unwrap_or("/");
+    let path = full_path.split('?').next().unwrap_or(full_path);
+
+    // Check for WebSocket upgrade
+    let is_ws_upgrade = req.headers.iter().any(|h| {
+        h.name.eq_ignore_ascii_case("Upgrade")
+            && std::str::from_utf8(h.value).unwrap_or("").eq_ignore_ascii_case("websocket")
+    });
+
+    if method == "GET" && path == "/ws" && is_ws_upgrade {
+        // WebSocket upgrade — hand off raw bytes + stream to acceptor
+        let mut ws = acceptor.accept(&cx, &buf[..request_end], stream).await
+            .map_err(|e| format!("ws accept: {e}"))?;
+        ws_client_loop(&cx, &mut ws, state).await;
+        return Ok(());
+    }
+
+    // Regular HTTP — dispatch and respond
+    let response = dispatch_http(method, path, full_path, state);
+    stream.write_all(&response).await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket client loop
+// ---------------------------------------------------------------------------
+
+async fn ws_client_loop(cx: &Cx, ws: &mut ServerWebSocket<TcpStream>, state: &AppState) {
+    let mut last_seq: u64 = 0;
+
+    // Send initial status + graph as first message
+    let init = serde_json::json!({
+        "type": "init",
+        "graph": &state.graph,
+        "status": &*state.status.read().unwrap(),
+    });
+    if ws.send(cx, Message::text(init.to_string())).await.is_err() {
+        return;
+    }
+
+    // Send any buffered events (collect first to release lock before awaiting)
+    let buffered: Vec<(u64, String)> = {
+        let log = state.event_log.lock().unwrap();
+        log.since(0).into_iter().map(|(seq, json)| (seq, json.to_string())).collect()
+    };
+    for (seq, json) in &buffered {
+        let msg = format!(r#"{{"type":"event","seq":{seq},"data":{json}}}"#);
+        if ws.send(cx, Message::text(msg)).await.is_err() {
+            return;
+        }
+        last_seq = *seq;
+    }
+
+    loop {
+        if state.shutdown.load(Ordering::Acquire) {
+            let _ = ws.close(asupersync::net::websocket::CloseReason::going_away()).await;
+            return;
+        }
+
+        // Check for new events
+        let new_events: Vec<(u64, String)> = {
+            let log = state.event_log.lock().unwrap();
+            log.since(last_seq)
+                .into_iter()
+                .map(|(seq, json)| (seq, json.to_string()))
+                .collect()
+        };
+
+        for (seq, json) in &new_events {
+            let msg = format!(r#"{{"type":"event","seq":{seq},"data":{json}}}"#);
+            if ws.send(cx, Message::text(msg)).await.is_err() {
+                return;
+            }
+            last_seq = *seq;
+        }
+
+        if new_events.is_empty() {
+            // Wait for new events or client message
+            // We use a simple approach: wait on Notify with a timeout,
+            // then check for incoming WS messages non-blockingly.
+            let wait_result = asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(15),
+                state.event_notify.notified(),
+            ).await;
+
+            match wait_result {
+                Ok(()) => {} // notified — new events available, loop back
+                Err(_) => {
+                    // Timeout — send ping as keepalive
+                    if ws.ping(asupersync::bytes::Bytes::new()).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP dispatch (non-WebSocket requests)
+// ---------------------------------------------------------------------------
+
+fn dispatch_http(method: &str, path: &str, _full_path: &str, state: &AppState) -> Vec<u8> {
+    match (method, path) {
+        ("GET", "/") => http_response(200, "text/html; charset=utf-8", include_bytes!("watch.html")),
+        ("GET", "/api/graph") => json_response(&state.graph),
+        ("GET", "/api/dot") => http_response(200, "text/plain; charset=utf-8", state.dot_source.as_bytes()),
+        ("GET", "/api/status") => {
+            let status = state.status.read().unwrap().clone();
+            json_response(&status)
+        }
+        ("GET", p) if p.starts_with("/api/artifacts/") => serve_artifact(state, p),
+        ("POST", "/api/control/start") => control_start(state),
+        ("POST", "/api/control/pause") => control_pause(state),
+        ("POST", "/api/control/resume") => control_resume(state),
+        ("POST", "/api/control/stop") => control_stop(state),
+        _ => http_response(404, "text/plain", b"Not Found"),
+    }
+}
+
+fn http_response(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        409 => "Conflict",
+        413 => "Request Entity Too Large",
+        _ => "Unknown",
+    };
+    let mut resp = format!(
+        "HTTP/1.1 {status} {reason}\r\n\
+         Content-Type: {content_type}\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         \r\n",
+        body.len(),
+    ).into_bytes();
+    resp.extend_from_slice(body);
+    resp
+}
+
+fn json_response<T: Serialize>(value: &T) -> Vec<u8> {
+    let body = serde_json::to_vec(value).unwrap_or_default();
+    http_response(200, "application/json", &body)
+}
+
+async fn write_http_error(
+    stream: &mut TcpStream,
+    status: u16,
+    msg: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let resp = http_response(status, "text/plain", msg.as_bytes());
+    stream.write_all(&resp).await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Artifact serving
+// ---------------------------------------------------------------------------
+
+fn serve_artifact(state: &AppState, path: &str) -> Vec<u8> {
+    let rest = match path.strip_prefix("/api/artifacts/") {
+        Some(r) => r,
+        None => return http_response(404, "text/plain", b"Not Found"),
+    };
+
+    let (node_id, filename) = match rest.split_once('/') {
+        Some(pair) => pair,
+        None => return http_response(400, "text/plain", b"missing filename"),
+    };
+
+    const ALLOWED: &[&str] = &["prompt.md", "response.md", "status.json"];
+    if !ALLOWED.contains(&filename) {
+        return http_response(400, "text/plain", b"invalid filename");
+    }
+
+    if node_id.contains("..") || node_id.contains('/') || node_id.contains('\\') {
+        return http_response(400, "text/plain", b"invalid node_id");
+    }
+
+    let file_path = state.logs_root.join(node_id).join(filename);
+    match std::fs::read(&file_path) {
+        Ok(content) => {
+            let ct = if filename.ends_with(".json") {
+                "application/json"
+            } else {
+                "text/plain; charset=utf-8"
+            };
+            http_response(200, ct, &content)
+        }
+        Err(_) => http_response(404, "text/plain", b"Not Found"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Control endpoints
+// ---------------------------------------------------------------------------
+
+fn control_start(state: &AppState) -> Vec<u8> {
+    let mut trigger = state.start_trigger.lock().unwrap();
+    if let Some(tx) = trigger.take() {
+        let _ = tx.send(());
+        http_response(200, "text/plain", b"")
+    } else {
+        http_response(409, "text/plain", b"already started")
+    }
+}
+
+fn control_pause(state: &AppState) -> Vec<u8> {
+    state.control.pause();
+    http_response(200, "text/plain", b"")
+}
+
+fn control_resume(state: &AppState) -> Vec<u8> {
+    state.control.resume();
+    // Immediate status update for responsive UI
+    let mut status = state.status.write().unwrap();
+    if let WatchStatus::Paused {
+        ref active_nodes, ref completed_nodes, ref failed_nodes, ..
+    } = *status {
+        *status = WatchStatus::Running {
+            active_nodes: active_nodes.clone(),
+            completed_nodes: completed_nodes.clone(),
+            failed_nodes: failed_nodes.clone(),
+        };
+    }
+    http_response(200, "text/plain", b"")
+}
+
+fn control_stop(state: &AppState) -> Vec<u8> {
+    state.control.cancel();
+    // Also trigger start if pending, so the pipeline thread can exit
+    let mut trigger = state.start_trigger.lock().unwrap();
+    if let Some(tx) = trigger.take() {
+        let _ = tx.send(());
+    }
+    http_response(200, "text/plain", b"")
 }
 
 // ---------------------------------------------------------------------------
@@ -351,24 +664,19 @@ async fn pipeline_loop(
 }
 
 // ---------------------------------------------------------------------------
-// Bridge loop: tokio mpsc → event_log + status updates
+// Bridge loop: tokio mpsc → event_log + notify WS clients
 // ---------------------------------------------------------------------------
 
 async fn bridge_loop(state: Arc<AppState>, mut rx: forge_attractor::RuntimeEventReceiver) {
     while let Some(event) = rx.recv().await {
-        // Serialize event to JSON
         let json = serde_json::to_string(&event).unwrap_or_default();
-
-        // Update status
         update_status(&state, &event);
-
-        // Push to event log and notify waiting SSE clients
         {
             let mut log = state.event_log.lock().unwrap();
             log.push(json);
         }
-        // Wake up any threads blocked in the SSE long-poll
-        state.event_notify.notify_all();
+        // Wake all WS client tasks
+        state.event_notify.notify_waiters();
     }
 }
 
@@ -497,186 +805,31 @@ fn update_status(state: &AppState, event: &RuntimeEvent) {
 }
 
 // ---------------------------------------------------------------------------
-// HTTP request dispatch (bridges h1 types ↔ synchronous web::Router logic)
+// Low-level helpers
 // ---------------------------------------------------------------------------
 
-fn dispatch(req: H1Request, state: &AppState) -> H1Response {
-    let path = req.uri.split('?').next().unwrap_or(&req.uri);
-    let query_string = req.uri.split_once('?').map(|(_, q)| q);
-    let method = req.method.as_str();
-
-    // Manual route matching (direct and fast — no web::Router overhead for a handful of routes)
-    match (method, path) {
-        ("GET", "/") => serve_html(),
-        ("GET", "/api/graph") => serve_json(&state.graph),
-        ("GET", "/api/dot") => plain_text(&state.dot_source),
-        ("GET", "/api/status") => {
-            let status = state.status.read().unwrap().clone();
-            serve_json(&status)
-        }
-        ("GET", "/api/events") => serve_events(state, query_string),
-        ("GET", p) if p.starts_with("/api/artifacts/") => serve_artifact(state, p),
-        ("POST", "/api/control/start") => control_start(state),
-        ("POST", "/api/control/pause") => control_pause(state),
-        ("POST", "/api/control/resume") => control_resume(state),
-        ("POST", "/api/control/stop") => control_stop(state),
-        _ => H1Response::new(404, "Not Found", b"Not Found".to_vec()),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Route handlers
-// ---------------------------------------------------------------------------
-
-fn serve_html() -> H1Response {
-    let mut resp = H1Response::new(200, "OK", include_bytes!("watch.html").to_vec());
-    resp.headers.push(("Content-Type".into(), "text/html; charset=utf-8".into()));
-    resp
-}
-
-fn serve_json<T: Serialize>(value: &T) -> H1Response {
-    let body = serde_json::to_vec(value).unwrap_or_default();
-    let mut resp = H1Response::new(200, "OK", body);
-    resp.headers.push(("Content-Type".into(), "application/json".into()));
-    resp.headers.push(("Access-Control-Allow-Origin".into(), "*".into()));
-    resp
-}
-
-fn plain_text(text: &str) -> H1Response {
-    let mut resp = H1Response::new(200, "OK", text.as_bytes().to_vec());
-    resp.headers.push(("Content-Type".into(), "text/plain; charset=utf-8".into()));
-    resp
-}
-
-/// SSE long-poll: returns all events since `?after=<seq>`, blocking briefly if none available.
-fn serve_events(state: &AppState, query: Option<&str>) -> H1Response {
-    let after_seq: u64 = query
-        .and_then(|q| {
-            q.split('&')
-                .find_map(|pair| {
-                    let (k, v) = pair.split_once('=')?;
-                    if k == "after" { v.parse().ok() } else { None }
-                })
-        })
-        .unwrap_or(0);
-
-    // Check for events already available
-    {
-        let log = state.event_log.lock().unwrap();
-        let events = log.since(after_seq);
-        if !events.is_empty() {
-            return sse_response(&events, log.latest_seq());
+/// Find the end of HTTP headers (double CRLF).
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    for i in 0..buf.len().saturating_sub(3) {
+        if &buf[i..i + 4] == b"\r\n\r\n" {
+            return Some(i + 4);
         }
     }
-
-    // Block for up to 15 seconds waiting for new events
-    let guard = state.event_notify_lock.lock().unwrap();
-    let _guard = state.event_notify.wait_timeout(guard, Duration::from_secs(15)).unwrap();
-
-    // Check again after waking up
-    let log = state.event_log.lock().unwrap();
-    let events = log.since(after_seq);
-    sse_response(&events, log.latest_seq())
+    None
 }
 
-fn sse_response(events: &[&str], latest_seq: u64) -> H1Response {
-    let mut body = String::new();
-    for json in events {
-        body.push_str("data: ");
-        body.push_str(json);
-        body.push_str("\n\n");
-    }
-    // If no events, send a comment as keepalive
-    if events.is_empty() {
-        body.push_str(": keepalive\n\n");
-    }
+/// Read some bytes from a TcpStream (async).
+async fn read_some(stream: &mut TcpStream, buf: &mut [u8]) -> Result<usize, std::io::Error> {
+    use std::future::poll_fn;
+    use std::pin::Pin;
+    use asupersync::io::ReadBuf;
 
-    let mut resp = H1Response::new(200, "OK", body.into_bytes());
-    resp.headers.push(("Content-Type".into(), "text/event-stream".into()));
-    resp.headers.push(("Cache-Control".into(), "no-cache".into()));
-    resp.headers.push(("X-Last-Seq".into(), latest_seq.to_string()));
-    resp.headers.push(("Access-Control-Allow-Origin".into(), "*".into()));
-    resp
-}
-
-fn serve_artifact(state: &AppState, path: &str) -> H1Response {
-    // path = "/api/artifacts/{node_id}/{filename}"
-    let rest = match path.strip_prefix("/api/artifacts/") {
-        Some(r) => r,
-        None => return H1Response::new(404, "Not Found", Vec::new()),
-    };
-
-    let (node_id, filename) = match rest.split_once('/') {
-        Some(pair) => pair,
-        None => return H1Response::new(400, "Bad Request", b"missing filename".to_vec()),
-    };
-
-    const ALLOWED: &[&str] = &["prompt.md", "response.md", "status.json"];
-    if !ALLOWED.contains(&filename) {
-        return H1Response::new(400, "Bad Request", b"invalid filename".to_vec());
-    }
-
-    if node_id.contains("..") || node_id.contains('/') || node_id.contains('\\') {
-        return H1Response::new(400, "Bad Request", b"invalid node_id".to_vec());
-    }
-
-    let file_path = state.logs_root.join(node_id).join(filename);
-    match std::fs::read_to_string(&file_path) {
-        Ok(content) => {
-            let ct = if filename.ends_with(".json") {
-                "application/json"
-            } else {
-                "text/plain; charset=utf-8"
-            };
-            let mut resp = H1Response::new(200, "OK", content.into_bytes());
-            resp.headers.push(("Content-Type".into(), ct.into()));
-            resp
+    poll_fn(|cx| {
+        let mut read_buf = ReadBuf::new(buf);
+        match Pin::new(&mut *stream).poll_read(cx, &mut read_buf) {
+            std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(read_buf.filled().len())),
+            std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
+            std::task::Poll::Pending => std::task::Poll::Pending,
         }
-        Err(_) => H1Response::new(404, "Not Found", Vec::new()),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Control endpoints
-// ---------------------------------------------------------------------------
-
-fn control_start(state: &AppState) -> H1Response {
-    let mut trigger = state.start_trigger.lock().unwrap();
-    if let Some(tx) = trigger.take() {
-        let _ = tx.send(());
-        H1Response::new(200, "OK", Vec::new())
-    } else {
-        H1Response::new(409, "Conflict", b"already started".to_vec())
-    }
-}
-
-fn control_pause(state: &AppState) -> H1Response {
-    state.control.pause();
-    H1Response::new(200, "OK", Vec::new())
-}
-
-fn control_resume(state: &AppState) -> H1Response {
-    state.control.resume();
-    // Immediate status update for responsive UI
-    let mut status = state.status.write().unwrap();
-    if let WatchStatus::Paused {
-        ref active_nodes, ref completed_nodes, ref failed_nodes, ..
-    } = *status {
-        *status = WatchStatus::Running {
-            active_nodes: active_nodes.clone(),
-            completed_nodes: completed_nodes.clone(),
-            failed_nodes: failed_nodes.clone(),
-        };
-    }
-    H1Response::new(200, "OK", Vec::new())
-}
-
-fn control_stop(state: &AppState) -> H1Response {
-    state.control.cancel();
-    // Also trigger start if pending, so the pipeline thread can exit
-    let mut trigger = state.start_trigger.lock().unwrap();
-    if let Some(tx) = trigger.take() {
-        let _ = tx.send(());
-    }
-    H1Response::new(200, "OK", Vec::new())
+    }).await
 }
