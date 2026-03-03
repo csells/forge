@@ -8,7 +8,6 @@ notes-world/
 .playwright-mcp/
 .tmp/
 data/
-.claude/
 .forge-watch-*/
 
 # ===========================================================================
